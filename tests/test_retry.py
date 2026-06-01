@@ -41,8 +41,12 @@ class FakeResult:
         self.output = output
         self._usage = usage
 
+    @property
     def usage(self) -> Any:
         return self._usage
+
+    def all_messages_json(self) -> bytes:
+        return b"[]"
 
 
 class _ScriptedRun:

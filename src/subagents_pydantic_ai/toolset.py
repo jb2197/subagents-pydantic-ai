@@ -376,6 +376,15 @@ def create_subagent_toolset(  # noqa: C901
             resolved_mode = mode
 
         if resolved_mode == "sync":
+            handle = TaskHandle(
+                task_id=task_id,
+                subagent_name=config["name"],
+                description=description,
+                status=TaskStatus.RUNNING,
+                priority=priority,
+                started_at=datetime.now(),
+            )
+            task_manager.handles[task_id] = handle
             return await _run_sync(
                 agent=agent,
                 config=config,
@@ -385,6 +394,7 @@ def create_subagent_toolset(  # noqa: C901
                 extra_toolsets=runtime_toolsets,
                 ask_user=ask_user,
                 usage_limits=resolved_usage_limits,
+                handle=handle,
             )
         else:
             return await _run_async(
@@ -424,11 +434,6 @@ def create_subagent_toolset(  # noqa: C901
 
         if handle.status == TaskStatus.COMPLETED:
             status_info.append(f"Result: {handle.result}")
-            if handle.usage is not None:
-                u = handle.usage
-                inp = getattr(u, "input_tokens", 0)
-                out = getattr(u, "output_tokens", 0)
-                status_info.append(f"Usage: {inp + out} tokens ({inp} in / {out} out)")
         elif handle.status == TaskStatus.FAILED:
             status_info.append(f"Error: {handle.error}")
         elif handle.status == TaskStatus.WAITING_FOR_ANSWER:
@@ -623,6 +628,7 @@ async def _run_sync(
     extra_toolsets: list[Any] | None = None,
     ask_user: AskUserCallback | None = None,
     usage_limits: UsageLimits | None = None,
+    handle: TaskHandle | None = None,
 ) -> str:
     """Run a subagent task synchronously (blocking).
 
@@ -640,6 +646,7 @@ async def _run_sync(
             its run loop is blocked here.
         usage_limits: Optional pydantic-ai usage limits forwarded to the
             subagent run (honoured on every retry attempt).
+        handle: Optional task handle populated for Python-side observability.
 
     Returns:
         The subagent's response.
@@ -671,8 +678,20 @@ async def _run_sync(
             run_kwargs=run_kwargs,
             retry=RetryConfig.from_config(config),
         )
-        return _serialize_output(result.output)
+        output = _serialize_output(result.output)
+        if handle is not None:
+            handle.result = output
+            handle.error = None
+            handle.usage = result.usage
+            handle.message_history = result.all_messages_json().decode()
+            handle.status = TaskStatus.COMPLETED
+            handle.completed_at = datetime.now()
+        return output
     except Exception as e:
+        if handle is not None:
+            handle.status = TaskStatus.FAILED
+            handle.error = str(e)
+            handle.completed_at = datetime.now()
         return f"Error executing task: {e}"
 
 
@@ -760,8 +779,9 @@ async def _run_async(
             )
             handle.result = _serialize_output(result.output)
             handle.error = None
-            if hasattr(result, "usage"):
-                handle.usage = result.usage()
+            message_history = result.all_messages_json()
+            handle.usage = result.usage
+            handle.message_history = message_history.decode()
             handle.status = TaskStatus.COMPLETED
         except asyncio.CancelledError:
             handle.status = TaskStatus.CANCELLED

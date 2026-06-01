@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,7 +18,7 @@ from subagents_pydantic_ai.toolset import (
     _run_async,
     _run_sync,
 )
-from subagents_pydantic_ai.types import CompiledSubAgent, TaskPriority, TaskStatus
+from subagents_pydantic_ai.types import CompiledSubAgent, TaskHandle, TaskPriority, TaskStatus
 
 
 @dataclass
@@ -41,21 +42,47 @@ class MockRunContext:
 class MockUsage:
     """Mock RunUsage."""
 
-    def __init__(self, input_tokens: int = 100, output_tokens: int = 50, requests: int = 1):
+    def __init__(
+        self,
+        input_tokens: int = 100,
+        output_tokens: int = 50,
+        requests: int = 1,
+        details: dict[str, int] | None = None,
+    ):
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.requests = requests
+        self.details = details or {}
+
+    def opentelemetry_attributes(self) -> dict[str, int]:
+        attrs = {
+            "gen_ai.usage.input_tokens": self.input_tokens,
+            "gen_ai.usage.output_tokens": self.output_tokens,
+        }
+        attrs.update({f"gen_ai.usage.details.{key}": value for key, value in self.details.items()})
+        return attrs
 
 
 class MockResult:
     """Mock agent result."""
 
-    def __init__(self, output: Any = "mock result"):
+    def __init__(
+        self,
+        output: Any = "mock result",
+        *,
+        usage: MockUsage | None = None,
+        messages: list[Any] | None = None,
+    ):
         self.output = output
-        self._usage = MockUsage()
+        self._usage = usage or MockUsage()
+        self._messages = messages
 
+    @property
     def usage(self) -> MockUsage:
         return self._usage
+
+    def all_messages_json(self) -> bytes:
+        return json.dumps(self._messages or []).encode()
 
 
 class _FakeRun:
@@ -790,6 +817,43 @@ class TestRunSync:
         assert mock_agent.iter_calls[0]["usage_limits"] is usage_limits
 
     @pytest.mark.asyncio
+    async def test_run_sync_stores_usage_details_and_message_history_on_handle(self):
+        """Sync execution stores observability data on the supplied handle."""
+        mock_agent = FakeAgent(
+            result=MockResult(
+                "task completed",
+                usage=MockUsage(details={"reasoning_tokens": 42}),
+                messages=[{"role": "user", "content": "work"}],
+            )
+        )
+        handle = TaskHandle(
+            task_id="task-123",
+            subagent_name="test",
+            description="do the thing",
+        )
+
+        config = SubAgentConfig(
+            name="test",
+            description="Test agent",
+            instructions="Do test",
+        )
+
+        result = await _run_sync(
+            agent=mock_agent,
+            config=config,
+            description="do the thing",
+            deps=MockDeps(),
+            task_id="task-123",
+            handle=handle,
+        )
+
+        assert result == "task completed"
+        assert handle.status == TaskStatus.COMPLETED
+        assert handle.usage.details["reasoning_tokens"] == 42
+        assert handle.message_history is not None
+        assert '"content": "work"' in handle.message_history
+
+    @pytest.mark.asyncio
     async def test_run_sync_error(self):
         """Test sync execution with error."""
         mock_agent = FakeAgent(error=Exception("Something went wrong"))
@@ -933,6 +997,47 @@ class TestRunAsync:
         assert handle.usage.input_tokens == 100
 
     @pytest.mark.asyncio
+    async def test_run_async_stores_usage_details_and_message_history(self):
+        """Async execution stores full usage details and subagent messages."""
+        import asyncio
+
+        from subagents_pydantic_ai import InMemoryMessageBus, TaskManager
+
+        mock_agent = FakeAgent(
+            result=MockResult(
+                "task completed",
+                usage=MockUsage(details={"reasoning_tokens": 17}),
+                messages=[{"role": "assistant", "content": "done"}],
+            )
+        )
+
+        config = SubAgentConfig(
+            name="test",
+            description="Test agent",
+            instructions="Do test",
+        )
+
+        message_bus = InMemoryMessageBus()
+        task_manager = TaskManager(message_bus=message_bus)
+
+        await _run_async(
+            agent=mock_agent,
+            config=config,
+            description="do the thing",
+            deps=MockDeps(),
+            task_id="task-observe",
+            task_manager=task_manager,
+            message_bus=message_bus,
+        )
+        await asyncio.sleep(0.1)
+
+        handle = task_manager.get_handle("task-observe")
+        assert handle is not None
+        assert handle.usage.details["reasoning_tokens"] == 17
+        assert handle.message_history is not None
+        assert '"content": "done"' in handle.message_history
+
+    @pytest.mark.asyncio
     async def test_run_async_forwards_usage_limits(self):
         """Async background execution forwards usage limits to the run."""
         from subagents_pydantic_ai import InMemoryMessageBus, TaskManager
@@ -1024,7 +1129,7 @@ class TestToolsetIntegration:
                 "subagents_pydantic_ai.toolset._run_sync",
                 new_callable=AsyncMock,
                 return_value="Sync result",
-            ),
+            ) as mock_run_sync,
         ):
             toolset = create_subagent_toolset(
                 subagents=[config],
@@ -1037,6 +1142,8 @@ class TestToolsetIntegration:
             result = await task_tool.function(ctx, "do something", "helper", "sync")
 
             assert result == "Sync result"
+            handle = mock_run_sync.call_args.kwargs["handle"]
+            assert handle.task_id in toolset.task_manager.handles  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_task_sync_forwards_ask_user(self):
@@ -2922,8 +3029,8 @@ class TestUsageTracking:
     """Tests for subagent token usage tracking."""
 
     @pytest.mark.anyio
-    async def test_check_task_shows_usage(self):
-        """check_task displays usage info for completed tasks."""
+    async def test_check_task_does_not_show_usage(self):
+        """check_task keeps observability data out of tool-return text."""
         from subagents_pydantic_ai.types import TaskHandle, TaskStatus
 
         toolset = create_subagent_toolset(default_model="test")
@@ -2941,9 +3048,84 @@ class TestUsageTracking:
         check_tool = toolset.tools["check_task"]
         ctx = MockRunContext(deps=MockDeps())
         result = await check_tool.function(ctx, "test-usage")
-        assert "500" in result
-        assert "200" in result
-        assert "Usage:" in result
+        assert "Result: done" in result
+        assert "Usage:" not in result
+        assert handle.usage.input_tokens == 500
+
+    @pytest.mark.anyio
+    async def test_check_task_does_not_show_usage_details(self):
+        """Usage details stay available on the handle only."""
+        from subagents_pydantic_ai.types import TaskHandle, TaskStatus
+
+        toolset = create_subagent_toolset(default_model="test")
+        tm = toolset.task_manager  # type: ignore[attr-defined]
+        handle = TaskHandle(
+            task_id="test-details",
+            subagent_name="worker",
+            description="test task",
+            status=TaskStatus.COMPLETED,
+            result="done",
+            usage=MockUsage(input_tokens=500, output_tokens=200, details={"reasoning_tokens": 31}),
+        )
+        tm.handles["test-details"] = handle
+
+        check_tool = toolset.tools["check_task"]
+        ctx = MockRunContext(deps=MockDeps())
+        result = await check_tool.function(ctx, "test-details")
+        assert "Usage attributes:" not in result
+        assert "gen_ai.usage.details.reasoning_tokens" not in result
+        assert handle.usage.details["reasoning_tokens"] == 31
+
+    @pytest.mark.anyio
+    async def test_check_task_does_not_show_message_history(self):
+        """Message history stays available on the handle only."""
+        from subagents_pydantic_ai.types import TaskHandle, TaskStatus
+
+        toolset = create_subagent_toolset(default_model="test")
+        tm = toolset.task_manager  # type: ignore[attr-defined]
+        handle = TaskHandle(
+            task_id="test-history",
+            subagent_name="worker",
+            description="test task",
+            status=TaskStatus.COMPLETED,
+            result="done",
+            usage=MockUsage(),
+            message_history='[{"role": "assistant", "content": "history"}]',
+        )
+        tm.handles["test-history"] = handle
+
+        check_tool = toolset.tools["check_task"]
+        ctx = MockRunContext(deps=MockDeps())
+        result = await check_tool.function(ctx, "test-history")
+        assert "Message history:" not in result
+        assert '"content": "history"' not in result
+        assert handle.message_history == '[{"role": "assistant", "content": "history"}]'
+
+    @pytest.mark.anyio
+    async def test_wait_tasks_does_not_show_observability(self):
+        """wait_tasks keeps observability data out of tool-return text."""
+        from subagents_pydantic_ai.types import TaskHandle, TaskStatus
+
+        toolset = create_subagent_toolset(default_model="test")
+        tm = toolset.task_manager  # type: ignore[attr-defined]
+        handle = TaskHandle(
+            task_id="wait-observe",
+            subagent_name="worker",
+            description="test task",
+            status=TaskStatus.COMPLETED,
+            result="done",
+            usage=MockUsage(details={"reasoning_tokens": 23}),
+            message_history='[{"role": "assistant", "content": "wait history"}]',
+        )
+        tm.handles["wait-observe"] = handle
+
+        wait_tool = toolset.tools["wait_tasks"]
+        ctx = MockRunContext(deps=MockDeps())
+        result = await wait_tool.function(ctx, ["wait-observe"])
+        assert "gen_ai.usage.details.reasoning_tokens" not in result
+        assert '"content": "wait history"' not in result
+        assert handle.usage.details["reasoning_tokens"] == 23
+        assert handle.message_history == '[{"role": "assistant", "content": "wait history"}]'
 
     @pytest.mark.anyio
     async def test_list_handles(self):
@@ -3024,41 +3206,3 @@ class TestUsageTracking:
         result = await check_tool.function(ctx, "no-usage")
         assert "Result: done" in result
         assert "Usage:" not in result
-
-    @pytest.mark.anyio
-    async def test_run_async_no_usage_attr(self):
-        """Async run handles results without usage() method."""
-        import asyncio
-
-        from subagents_pydantic_ai import InMemoryMessageBus, TaskManager
-
-        class BareResult:
-            def __init__(self, output: str):
-                self.output = output
-
-        mock_agent = FakeAgent(result=BareResult("bare output"))
-
-        config = SubAgentConfig(
-            name="test",
-            description="Test",
-            instructions="Do test",
-        )
-        message_bus = InMemoryMessageBus()
-        task_manager = TaskManager(message_bus=message_bus)
-
-        await _run_async(
-            agent=mock_agent,
-            config=config,
-            description="test",
-            deps=MockDeps(),
-            task_id="bare-1",
-            task_manager=task_manager,
-            message_bus=message_bus,
-        )
-        await asyncio.sleep(0.1)
-
-        handle = task_manager.get_handle("bare-1")
-        assert handle is not None
-        assert handle.status == TaskStatus.COMPLETED
-        assert handle.result == "bare output"
-        assert handle.usage is None

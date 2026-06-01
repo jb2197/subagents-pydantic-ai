@@ -320,6 +320,7 @@ class TaskHandle:
     pending_question: str | None = None
     usage: Any = None
     """Token usage from the subagent run (``RunUsage`` from pydantic-ai)."""
+    message_history: str | None = None
     retry_count: int = 0
     """Number of transient-failure retries performed for this task."""
 
