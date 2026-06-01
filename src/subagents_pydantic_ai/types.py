@@ -305,6 +305,7 @@ class TaskHandle:
         result: Task result (if completed)
         error: Error message (if failed)
         pending_question: Question waiting for answer (if any)
+        session_id: Session ID for continuing this subagent conversation
     """
 
     task_id: str
@@ -318,6 +319,7 @@ class TaskHandle:
     result: str | None = None
     error: str | None = None
     pending_question: str | None = None
+    session_id: str | None = None
     usage: Any = None
     """Token usage from the subagent run (``RunUsage`` from pydantic-ai)."""
     message_history: str | None = None

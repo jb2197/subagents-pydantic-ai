@@ -75,14 +75,24 @@ class MockResult:
     ):
         self.output = output
         self._usage = usage or MockUsage()
-        self._messages = messages
+        self._messages = messages or []
 
     @property
     def usage(self) -> MockUsage:
         return self._usage
 
+    def all_messages(self) -> list[Any]:
+        return self._messages
+
     def all_messages_json(self) -> bytes:
-        return json.dumps(self._messages or []).encode()
+        return json.dumps(self._messages).encode()
+
+
+class MockResultWithMessages(MockResult):
+    """Mock agent result that exposes pydantic-ai-style message history."""
+
+    def __init__(self, output: Any = "mock result", messages: list[Any] | None = None):
+        super().__init__(output, messages=messages)
 
 
 class _FakeRun:
@@ -854,6 +864,36 @@ class TestRunSync:
         assert '"content": "work"' in handle.message_history
 
     @pytest.mark.asyncio
+    async def test_run_sync_resumes_and_captures_message_history(self):
+        """Sessions can seed and update sync subagent history."""
+        seed_history = [{"role": "assistant", "content": "previous"}]
+        new_history = [{"role": "assistant", "content": "updated"}]
+        captured: list[list[Any]] = []
+        mock_agent = FakeAgent(
+            result=MockResultWithMessages("task completed", messages=new_history)
+        )
+
+        config = SubAgentConfig(
+            name="test",
+            description="Test agent",
+            instructions="Do test",
+        )
+
+        result = await _run_sync(
+            agent=mock_agent,
+            config=config,
+            description="do the next thing",
+            deps=MockDeps(),
+            task_id="task-123",
+            message_history=seed_history,
+            on_message_history=captured.append,
+        )
+
+        assert result == "task completed"
+        assert mock_agent.iter_calls[0]["message_history"] is seed_history
+        assert captured == [new_history]
+
+    @pytest.mark.asyncio
     async def test_run_sync_error(self):
         """Test sync execution with error."""
         mock_agent = FakeAgent(error=Exception("Something went wrong"))
@@ -957,6 +997,43 @@ class TestRunAsync:
         assert "Task started in background" in result
         assert "task-123" in result
         assert "check_task" in result
+
+    @pytest.mark.asyncio
+    async def test_run_async_resumes_and_captures_message_history(self):
+        """Explicit sessions can seed and update async subagent history."""
+        from subagents_pydantic_ai import InMemoryMessageBus, TaskManager
+
+        seed_history = [{"role": "assistant", "content": "previous"}]
+        new_history = [{"role": "assistant", "content": "updated"}]
+        captured: list[list[Any]] = []
+        mock_agent = FakeAgent(
+            result=MockResultWithMessages("task completed", messages=new_history)
+        )
+
+        config = SubAgentConfig(
+            name="test",
+            description="Test agent",
+            instructions="Do test",
+        )
+
+        message_bus = InMemoryMessageBus()
+        task_manager = TaskManager(message_bus=message_bus)
+
+        await _run_async(
+            agent=mock_agent,
+            config=config,
+            description="do the thing",
+            deps=MockDeps(),
+            task_id="task-123",
+            task_manager=task_manager,
+            message_bus=message_bus,
+            message_history=seed_history,
+            on_message_history=captured.append,
+        )
+        await asyncio.sleep(0.1)
+
+        assert mock_agent.iter_calls[0]["message_history"] is seed_history
+        assert captured == [new_history]
 
     @pytest.mark.asyncio
     async def test_run_async_task_completes(self):
@@ -1141,9 +1218,11 @@ class TestToolsetIntegration:
             ctx = MockRunContext(deps=MockDeps())
             result = await task_tool.function(ctx, "do something", "helper", "sync")
 
-            assert result == "Sync result"
+            assert result.startswith("Sync result\n\nSession ID: ")
             handle = mock_run_sync.call_args.kwargs["handle"]
             assert handle.task_id in toolset.task_manager.handles  # type: ignore[attr-defined]
+            assert handle.session_id in result
+            assert "pass this session_id to task()" in result
 
     @pytest.mark.asyncio
     async def test_task_sync_forwards_ask_user(self):
@@ -1212,6 +1291,107 @@ class TestToolsetIntegration:
 
             assert "Task started" in result
 
+    @pytest.mark.asyncio
+    async def test_task_session_reuses_message_history(self):
+        """task(session_id=...) stores and reuses history for that subagent."""
+        config = SubAgentConfig(
+            name="worker",
+            description="Does work",
+            instructions="Work on things",
+        )
+        saved_history = [{"role": "assistant", "content": "remembered"}]
+        mock_agent = FakeAgent(result=MockResultWithMessages("done", messages=saved_history))
+        mock_compiled = CompiledSubAgent(
+            name=config["name"],
+            description=config["description"],
+            config=config,
+            agent=mock_agent,
+        )
+
+        with patch(
+            "subagents_pydantic_ai.toolset._compile_subagent",
+            return_value=mock_compiled,
+        ):
+            toolset = create_subagent_toolset(
+                subagents=[config],
+                include_general_purpose=False,
+            )
+
+            task_tool = toolset.tools["task"]
+            ctx = MockRunContext(deps=MockDeps())
+
+            first = await task_tool.function(
+                ctx,
+                "remember this",
+                "worker",
+                "sync",
+                session_id="session-1",
+            )
+            second = await task_tool.function(
+                ctx,
+                "continue",
+                "worker",
+                "sync",
+                session_id="session-1",
+            )
+
+            assert first.startswith("done\n\nSession ID: session-1")
+            assert second.startswith("done\n\nSession ID: session-1")
+            assert mock_agent.iter_calls[0]["message_history"] is None
+            assert mock_agent.iter_calls[1]["message_history"] == saved_history
+            assert toolset.message_history_store[("worker", "session-1")] == saved_history
+
+    @pytest.mark.asyncio
+    async def test_task_without_session_creates_saved_session(self):
+        """Omitting session_id starts a new saved subagent conversation."""
+        config = SubAgentConfig(
+            name="worker",
+            description="Does work",
+            instructions="Work on things",
+        )
+        saved_history = [{"role": "assistant", "content": "remembered"}]
+        mock_agent = FakeAgent(result=MockResultWithMessages("done", messages=saved_history))
+        mock_compiled = CompiledSubAgent(
+            name=config["name"],
+            description=config["description"],
+            config=config,
+            agent=mock_agent,
+        )
+
+        with patch(
+            "subagents_pydantic_ai.toolset._compile_subagent",
+            return_value=mock_compiled,
+        ):
+            toolset = create_subagent_toolset(
+                subagents=[config],
+                include_general_purpose=False,
+            )
+
+            task_tool = toolset.tools["task"]
+            ctx = MockRunContext(deps=MockDeps())
+
+            first = await task_tool.function(ctx, "remember this", "worker", "sync")
+            first_session_id = first.split("Session ID: ")[1].split("\n")[0]
+            second = await task_tool.function(ctx, "fresh task", "worker", "sync")
+            second_session_id = second.split("Session ID: ")[1].split("\n")[0]
+            continued = await task_tool.function(
+                ctx,
+                "continue first",
+                "worker",
+                "sync",
+                session_id=first_session_id,
+            )
+
+            assert first_session_id
+            assert second_session_id
+            assert second_session_id != first_session_id
+            assert continued.startswith(f"done\n\nSession ID: {first_session_id}")
+            assert mock_agent.iter_calls[0]["message_history"] is None
+            assert mock_agent.iter_calls[1]["message_history"] is None
+            assert mock_agent.iter_calls[2]["message_history"] == saved_history
+            assert toolset.message_history_store[("worker", first_session_id)] == saved_history
+            assert toolset.message_history_store[("worker", second_session_id)] == saved_history
+
 
 class TestAutoModeSelection:
     """Tests for auto-mode selection in task tool."""
@@ -1255,7 +1435,7 @@ class TestAutoModeSelection:
                 False,  # may_need_clarification
             )
 
-            assert result == "Sync result"
+            assert result.startswith("Sync result\n\nSession ID: ")
             mock_sync.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1339,7 +1519,7 @@ class TestAutoModeSelection:
                 False,  # may_need_clarification
             )
 
-            assert result == "Sync result"
+            assert result.startswith("Sync result\n\nSession ID: ")
             mock_sync.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1418,7 +1598,7 @@ class TestAutoModeSelection:
                 "auto",  # auto mode - uses config's typical_complexity
             )
 
-            assert result == "Sync result"
+            assert result.startswith("Sync result\n\nSession ID: ")
             mock_sync.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1459,7 +1639,7 @@ class TestAutoModeSelection:
                 "auto",
             )
 
-            assert result == "Sync result"
+            assert result.startswith("Sync result\n\nSession ID: ")
             mock_sync.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1501,7 +1681,7 @@ class TestAutoModeSelection:
                 "complex",  # Would normally be async
             )
 
-            assert result == "Sync result"
+            assert result.startswith("Sync result\n\nSession ID: ")
             mock_sync.assert_called_once()
 
 

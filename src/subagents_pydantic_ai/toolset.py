@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Literal
 
@@ -61,6 +62,29 @@ def _serialize_output(output: Any) -> str:
 
         return json.dumps(dataclasses.asdict(output), default=str)
     return str(output)
+
+
+def _capture_message_history(
+    result: Any,
+    on_message_history: Callable[[list[Any]], None] | None,
+) -> None:
+    """Capture a successful run's message history for a session."""
+    if on_message_history is None:
+        return
+
+    messages: Any = result.all_messages()
+    if messages:
+        on_message_history(list(messages))
+
+
+def _format_session_result(output: str, session_id: str) -> str:
+    """Append session continuation instructions to a subagent result."""
+    return (
+        f"{output}\n\n"
+        f"Session ID: {session_id}\n"
+        "To continue this subagent conversation, pass this session_id to task(). "
+        "Omit session_id to start a new conversation."
+    )
 
 
 def _create_general_purpose_config() -> SubAgentConfig:
@@ -293,6 +317,7 @@ def create_subagent_toolset(  # noqa: C901
     # Create shared state
     message_bus = InMemoryMessageBus()
     task_manager = TaskManager(message_bus=message_bus)
+    message_history_store: dict[tuple[str, str], list[Any]] = {}
 
     # Build dynamic task description with available subagents
     subagent_list = "\n".join(f"- {name}: {c.description}" for name, c in compiled.items())
@@ -313,6 +338,7 @@ def create_subagent_toolset(  # noqa: C901
         complexity: Literal["simple", "moderate", "complex"] | None = None,
         requires_user_context: bool = False,
         may_need_clarification: bool = False,
+        session_id: str | None = None,
     ) -> str:
         """Delegate a task to a specialized subagent.
 
@@ -325,6 +351,9 @@ def create_subagent_toolset(  # noqa: C901
             complexity: Override complexity estimate ("simple", "moderate", "complex").
             requires_user_context: Whether task needs ongoing user interaction.
             may_need_clarification: Whether task might need clarifying questions.
+            session_id: Optional explicit session ID. When omitted, a new subagent
+                conversation is created. When provided, this subagent resumes from
+                the previous successful task with the same session.
         """
         # Validate subagent_type — check static compiled dict first, then dynamic registry
         if subagent_type in compiled:
@@ -363,6 +392,13 @@ def create_subagent_toolset(  # noqa: C901
         # Generate task ID
         task_id = str(uuid.uuid4())[:8]
 
+        effective_session_id = session_id or str(uuid.uuid4())[:8]
+        session_key = (config["name"], effective_session_id)
+        message_history = message_history_store.get(session_key)
+
+        def save_message_history(messages: list[Any]) -> None:
+            message_history_store[session_key] = messages
+
         # Resolve mode if "auto"
         if mode == "auto":
             characteristics = TaskCharacteristics(
@@ -382,10 +418,11 @@ def create_subagent_toolset(  # noqa: C901
                 description=description,
                 status=TaskStatus.RUNNING,
                 priority=priority,
+                session_id=effective_session_id,
                 started_at=datetime.now(),
             )
             task_manager.handles[task_id] = handle
-            return await _run_sync(
+            result = await _run_sync(
                 agent=agent,
                 config=config,
                 description=description,
@@ -395,7 +432,10 @@ def create_subagent_toolset(  # noqa: C901
                 ask_user=ask_user,
                 usage_limits=resolved_usage_limits,
                 handle=handle,
+                message_history=message_history,
+                on_message_history=save_message_history,
             )
+            return _format_session_result(result, effective_session_id)
         else:
             return await _run_async(
                 agent=agent,
@@ -408,6 +448,9 @@ def create_subagent_toolset(  # noqa: C901
                 extra_toolsets=runtime_toolsets,
                 priority=priority,
                 usage_limits=resolved_usage_limits,
+                session_id=effective_session_id,
+                message_history=message_history,
+                on_message_history=save_message_history,
             )
 
     @toolset.tool(description=_descs.get("check_task", CHECK_TASK_DESCRIPTION))
@@ -431,6 +474,8 @@ def create_subagent_toolset(  # noqa: C901
             f"Status: {handle.status}",
             f"Description: {handle.description}",
         ]
+        if handle.session_id is not None:
+            status_info.append(f"Session ID: {handle.session_id}")
 
         if handle.status == TaskStatus.COMPLETED:
             status_info.append(f"Result: {handle.result}")
@@ -541,7 +586,13 @@ def create_subagent_toolset(  # noqa: C901
             if status == "completed":
                 finished_count += 1
                 result_preview = (handle.result or "")[:2000]
-                lines.append(f"- {tid} ({handle.subagent_name}): COMPLETED\n{result_preview}")
+                session_line = (
+                    f"Session ID: {handle.session_id}\n" if handle.session_id is not None else ""
+                )
+                lines.append(
+                    f"- {tid} ({handle.subagent_name}): COMPLETED\n"
+                    f"{session_line}{result_preview}"
+                )
             elif status == "failed":
                 finished_count += 1
                 lines.append(f"- {tid} ({handle.subagent_name}): FAILED - {handle.error}")
@@ -594,6 +645,7 @@ def create_subagent_toolset(  # noqa: C901
 
     # Expose task_manager for external monitoring (e.g., push notifications)
     toolset.task_manager = task_manager  # type: ignore[attr-defined]
+    toolset.message_history_store = message_history_store  # type: ignore[attr-defined]
 
     def get_total_usage() -> dict[str, int]:
         """Get aggregate token usage across all completed subagent tasks.
@@ -629,6 +681,8 @@ async def _run_sync(
     ask_user: AskUserCallback | None = None,
     usage_limits: UsageLimits | None = None,
     handle: TaskHandle | None = None,
+    message_history: list[Any] | None = None,
+    on_message_history: Callable[[list[Any]], None] | None = None,
 ) -> str:
     """Run a subagent task synchronously (blocking).
 
@@ -647,6 +701,9 @@ async def _run_sync(
         usage_limits: Optional pydantic-ai usage limits forwarded to the
             subagent run (honoured on every retry attempt).
         handle: Optional task handle populated for Python-side observability.
+        message_history: Optional prior message history for a subagent session.
+        on_message_history: Optional callback that receives the successful
+            run's full message history.
 
     Returns:
         The subagent's response.
@@ -670,6 +727,8 @@ async def _run_sync(
         run_kwargs["toolsets"] = extra_toolsets
     if usage_limits is not None:
         run_kwargs["usage_limits"] = usage_limits
+    if message_history is not None:
+        run_kwargs["message_history"] = message_history
 
     try:
         result = await run_with_retry(
@@ -678,6 +737,7 @@ async def _run_sync(
             run_kwargs=run_kwargs,
             retry=RetryConfig.from_config(config),
         )
+        _capture_message_history(result, on_message_history)
         output = _serialize_output(result.output)
         if handle is not None:
             handle.result = output
@@ -706,6 +766,9 @@ async def _run_async(
     priority: TaskPriority = TaskPriority.NORMAL,
     extra_toolsets: list[Any] | None = None,
     usage_limits: UsageLimits | None = None,
+    session_id: str | None = None,
+    message_history: list[Any] | None = None,
+    on_message_history: Callable[[list[Any]], None] | None = None,
 ) -> str:
     """Run a subagent task asynchronously (background).
 
@@ -721,6 +784,11 @@ async def _run_async(
         extra_toolsets: Additional toolsets to pass to agent.run().
         usage_limits: Optional pydantic-ai usage limits forwarded to the
             subagent run (honoured on every retry attempt).
+        session_id: Optional session ID for continuing this subagent
+            conversation.
+        message_history: Optional prior message history for a subagent session.
+        on_message_history: Optional callback that receives the successful
+            run's full message history.
 
     Returns:
         Task handle information as string.
@@ -732,6 +800,7 @@ async def _run_async(
         description=description,
         status=TaskStatus.PENDING,
         priority=priority,
+        session_id=session_id,
     )
 
     # Register subagent for messaging
@@ -763,6 +832,8 @@ async def _run_async(
             run_kwargs["toolsets"] = extra_toolsets
         if usage_limits is not None:
             run_kwargs["usage_limits"] = usage_limits
+        if message_history is not None:
+            run_kwargs["message_history"] = message_history
 
         def _on_retry(attempt: int, exc: BaseException, delay: float) -> None:
             handle.status = TaskStatus.RETRYING
@@ -777,11 +848,12 @@ async def _run_async(
                 retry=RetryConfig.from_config(config),
                 on_retry=_on_retry,
             )
+            _capture_message_history(result, on_message_history)
             handle.result = _serialize_output(result.output)
             handle.error = None
-            message_history = result.all_messages_json()
+            message_history_json = result.all_messages_json()
             handle.usage = result.usage
-            handle.message_history = message_history.decode()
+            handle.message_history = message_history_json.decode()
             handle.status = TaskStatus.COMPLETED
         except asyncio.CancelledError:
             handle.status = TaskStatus.CANCELLED
@@ -798,12 +870,19 @@ async def _run_async(
     # Create the background task
     task_manager.create_task(task_id, run_task(), handle)
 
-    return (
+    response = (
         f"Task started in background.\n"
         f"Task ID: {task_id}\n"
         f"Subagent: {config['name']}\n"
-        f"Use check_task('{task_id}') to check status."
     )
+    if session_id is not None:
+        response += (
+            f"Session ID: {session_id}\n"
+            "To continue this subagent conversation, pass this session_id to task(). "
+            "Omit session_id to start a new conversation.\n"
+        )
+    response += f"Use check_task('{task_id}') to check status."
+    return response
 
 
 # Alias for backwards compatibility
