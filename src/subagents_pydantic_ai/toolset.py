@@ -24,6 +24,7 @@ from subagents_pydantic_ai.prompts import (
     DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
     HARD_CANCEL_TASK_DESCRIPTION,
     LIST_ACTIVE_TASKS_DESCRIPTION,
+    SEND_MESSAGE_TO_SUBAGENT_DESCRIPTION,
     SOFT_CANCEL_TASK_DESCRIPTION,
     SUBAGENT_SYSTEM_PROMPT,
     TASK_TOOL_DESCRIPTION,
@@ -33,9 +34,11 @@ from subagents_pydantic_ai.prompts import (
 from subagents_pydantic_ai.protocols import SubAgentDepsProtocol
 from subagents_pydantic_ai.retry import RetryConfig, run_with_retry
 from subagents_pydantic_ai.types import (
+    AgentMessage,
     AskUserCallback,
     CompiledSubAgent,
     ExecutionMode,
+    MessageType,
     SubAgentConfig,
     TaskCharacteristics,
     TaskHandle,
@@ -50,9 +53,9 @@ from subagents_pydantic_ai.types import (
 def _serialize_output(output: Any) -> str:
     """Serialize subagent output preserving structure for Pydantic models.
 
-    For Pydantic models (BaseModel), returns JSON via ``model_dump_json()``.
-    For dataclasses with ``__dataclass_fields__``, returns JSON via ``json.dumps``.
-    For everything else, returns ``str(output)``.
+    For Pydantic models (BaseModel), returns JSON via `model_dump_json()`.
+    For dataclasses with `__dataclass_fields__`, returns JSON via `json.dumps`.
+    For everything else, returns `str(output)`.
     """
     if hasattr(output, "model_dump_json"):
         return output.model_dump_json()  # type: ignore[no-any-return]
@@ -72,7 +75,11 @@ def _capture_message_history(
     if on_message_history is None:
         return
 
-    messages: Any = result.all_messages()
+    all_messages = getattr(result, "all_messages", None)
+    if all_messages is None:
+        return
+
+    messages: Any = all_messages()
     if messages:
         on_message_history(list(messages))
 
@@ -85,6 +92,34 @@ def _format_session_result(output: str, session_id: str) -> str:
         "To continue this subagent conversation, pass this session_id to task(). "
         "Omit session_id to start a new conversation."
     )
+
+
+async def _drain_steering_messages(message_bus: InMemoryMessageBus, agent_id: str) -> list[str]:
+    """Drain pending parent -> child steering messages for a running subagent.
+
+    Pulls everything currently queued for ``agent_id`` and returns the text of
+    each ``TASK_UPDATE`` (the message type emitted by ``send_message_to_subagent``).
+    Other message types on the queue (e.g. an unused ``CANCEL_REQUEST`` — soft
+    cancel runs off the cancel event, not the bus) are ignored, as are empty
+    payloads.
+
+    Args:
+        message_bus: The bus the running subagent is registered on.
+        agent_id: The subagent's bus id (``subagent-{task_id}``).
+
+    Returns:
+        Steering instructions in delivery order (may be empty).
+    """
+    pending = await message_bus.get_messages(agent_id, timeout=0)
+    steering: list[str] = []
+    for msg in pending:
+        if msg.type != MessageType.TASK_UPDATE:
+            continue
+        payload = msg.payload
+        text = payload.get("message") if isinstance(payload, dict) else payload
+        if text:
+            steering.append(str(text))
+    return steering
 
 
 def _create_general_purpose_config() -> SubAgentConfig:
@@ -104,9 +139,9 @@ def _compile_subagent(
     """Compile a subagent configuration into a ready-to-use agent.
 
     Agent resolution priority:
-    1. ``config["agent"]`` — pre-built agent instance, used as-is
-    2. ``config["agent_factory"]`` — callable(config) -> agent
-    3. Default — creates ``pydantic_ai.Agent`` from config fields
+    1. `config["agent"]` — pre-built agent instance, used as-is
+    2. `config["agent_factory"]` — callable(config) -> agent
+    3. Default — creates `pydantic_ai.Agent` from config fields
 
     Args:
         config: The subagent configuration.
@@ -248,6 +283,7 @@ def create_subagent_toolset(  # noqa: C901
     - `check_task`: Check status of an async task
     - `answer_subagent`: Answer a question from a subagent
     - `list_active_tasks`: List all running background tasks
+    - `wait_tasks`: Wait for one or more background tasks to finish
     - `soft_cancel_task`: Request cooperative cancellation
     - `hard_cancel_task`: Immediately cancel a task
 
@@ -266,15 +302,15 @@ def create_subagent_toolset(  # noqa: C901
             Keys are tool names (task, check_task, answer_subagent,
             list_active_tasks, wait_tasks, soft_cancel_task, hard_cancel_task).
             When provided, the custom description replaces the built-in default.
-        ask_user: Optional callback invoked when a subagent calls ``ask_parent``
+        ask_user: Optional callback invoked when a subagent calls `ask_parent`
             in sync mode. Receives the question and must return the answer.
-            Required for sync-mode subagents with ``can_ask_questions=True``;
+            Required for sync-mode subagents with `can_ask_questions=True`;
             without it the subagent gets a configuration error. In async mode
-            the parent answers via ``answer_subagent`` instead.
+            the parent answers via `answer_subagent` instead.
         usage_limits: Optional pydantic-ai usage limits for delegated subagent
-            runs. Pass a ``UsageLimits`` instance to reuse the same limits for
+            runs. Pass a `UsageLimits` instance to reuse the same limits for
             every task, or a factory called once per task with the parent run
-            context and selected subagent config. A factory may return ``None``
+            context and selected subagent config. A factory may return `None`
             to run that task without explicit limits. Limits are honoured on
             every retry attempt as well.
 
@@ -517,6 +553,50 @@ def create_subagent_toolset(  # noqa: C901
 
         return "Error: Could not send answer - subagent is no longer waiting"
 
+    @toolset.tool(
+        description=_descs.get("send_message_to_subagent", SEND_MESSAGE_TO_SUBAGENT_DESCRIPTION)
+    )
+    async def send_message_to_subagent(
+        ctx: RunContext[SubAgentDepsProtocol],
+        task_id: str,
+        message: str,
+    ) -> str:
+        """Steer a running async subagent with an unprompted message.
+
+        The message is queued for the subagent and folded into its next model
+        request as an extra user instruction, so it adapts without losing
+        partial progress. Works only while the task is still running.
+
+        Args:
+            ctx: The run context.
+            task_id: The task ID of the running async subagent.
+            message: The steering instruction to deliver.
+        """
+        agent_id = f"subagent-{task_id}"
+        if not message_bus.is_registered(agent_id):
+            handle = task_manager.get_handle(task_id)
+            if handle is None:
+                return f"Error: Task '{task_id}' not found"
+            return (
+                f"Error: Task '{task_id}' is not accepting messages "
+                f"(status: {handle.status}). Steering only works for running "
+                "async tasks."
+            )
+
+        await message_bus.send(
+            AgentMessage(
+                type=MessageType.TASK_UPDATE,
+                sender="parent",
+                receiver=agent_id,
+                payload={"message": message},
+                task_id=task_id,
+            )
+        )
+        return (
+            f"Message delivered to task '{task_id}'; "
+            "it will be applied on the subagent's next step."
+        )
+
     @toolset.tool(description=_descs.get("list_active_tasks", LIST_ACTIVE_TASKS_DESCRIPTION))
     async def list_active_tasks(
         ctx: RunContext[SubAgentDepsProtocol],
@@ -549,8 +629,8 @@ def create_subagent_toolset(  # noqa: C901
             ctx: The run context.
             task_ids: List of task IDs to wait for.
             timeout: Maximum seconds to wait (default 300s / 5 minutes).
-            mode: ``"all"`` (default) waits for every task to finish.
-                ``"any"`` returns as soon as one task reaches a terminal
+            mode: `"all"` (default) waits for every task to finish.
+                `"any"` returns as soon as one task reaches a terminal
                 state (completed, failed, or cancelled), so the orchestrator
                 can react to the first finisher without stalling on the
                 slowest one.
@@ -564,11 +644,11 @@ def create_subagent_toolset(  # noqa: C901
 
         if tasks_to_await:
             aws = [t for _, t in tasks_to_await]
-            # Both modes route through ``asyncio.wait``. Unlike
-            # ``asyncio.wait_for(asyncio.gather(...))``, ``asyncio.wait`` does
+            # Both modes route through `asyncio.wait`. Unlike
+            # `asyncio.wait_for(asyncio.gather(...))`, `asyncio.wait` does
             # *not* cascade cancellation to its constituent tasks — neither on
             # timeout nor when its caller is cancelled (e.g. pydantic-ai's
-            # ``_call_tools`` sibling-cancel hitting this tool call). Workers
+            # `_call_tools` sibling-cancel hitting this tool call). Workers
             # keep owning their lifecycle, which is what an orchestrator
             # expects.
             return_when = asyncio.FIRST_COMPLETED if mode == "any" else asyncio.ALL_COMPLETED
@@ -650,7 +730,7 @@ def create_subagent_toolset(  # noqa: C901
     def get_total_usage() -> dict[str, int]:
         """Get aggregate token usage across all completed subagent tasks.
 
-        Returns dict with ``input_tokens``, ``output_tokens``, ``total_tokens``, ``requests``.
+        Returns dict with `input_tokens`, `output_tokens`, `total_tokens`, `requests`.
         """
         totals: dict[str, int] = {
             "input_tokens": 0,
@@ -695,7 +775,7 @@ async def _run_sync(
         extra_toolsets: Additional toolsets to pass to agent.run().
         ask_user: Optional callback for `ask_parent` in sync mode. When
             provided, it is attached to the cloned subagent deps via
-            ``_subagent_state["ask_callback"]`` so `ask_parent` resolves to
+            `_subagent_state["ask_callback"]` so `ask_parent` resolves to
             it. The parent agent cannot answer directly in sync mode because
             its run loop is blocked here.
         usage_limits: Optional pydantic-ai usage limits forwarded to the
@@ -840,6 +920,17 @@ async def _run_async(
             handle.retry_count = attempt
             handle.error = f"Transient error (retry {attempt}): {exc}"
 
+        def _cancel_requested() -> bool:
+            # Cooperative (soft) cancellation: TaskManager.soft_cancel sets this
+            # event, and run_with_retry polls it between graph nodes so the
+            # subagent stops at a clean boundary. Raised CancelledError is
+            # handled by the `except asyncio.CancelledError` branch below.
+            cancel_event = task_manager.get_cancel_event(task_id)
+            return cancel_event is not None and cancel_event.is_set()
+
+        async def _pending_steering() -> list[str]:
+            return await _drain_steering_messages(message_bus, agent_id)
+
         try:
             result = await run_with_retry(
                 agent,
@@ -847,13 +938,14 @@ async def _run_async(
                 run_kwargs=run_kwargs,
                 retry=RetryConfig.from_config(config),
                 on_retry=_on_retry,
+                cancel_check=_cancel_requested,
+                inject_messages=_pending_steering,
             )
             _capture_message_history(result, on_message_history)
             handle.result = _serialize_output(result.output)
             handle.error = None
-            message_history_json = result.all_messages_json()
             handle.usage = result.usage
-            handle.message_history = message_history_json.decode()
+            handle.message_history = result.all_messages_json().decode()
             handle.status = TaskStatus.COMPLETED
         except asyncio.CancelledError:
             handle.status = TaskStatus.CANCELLED

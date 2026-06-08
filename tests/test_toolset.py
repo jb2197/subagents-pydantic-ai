@@ -5,11 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import BaseModel
 from pydantic_ai import UsageLimits
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.toolsets import FunctionToolset
+from pydantic_graph import End
 
 from subagents_pydantic_ai import SubAgentConfig, create_subagent_toolset
 from subagents_pydantic_ai.toolset import (
@@ -96,17 +101,20 @@ class MockResultWithMessages(MockResult):
 
 
 class _FakeRun:
-    """Async-iterable stand-in for ``AgentRun`` (no extra graph nodes)."""
+    """Stand-in for `AgentRun` driven via `run.next` (no extra graph nodes).
+
+    Mirrors how `Agent.run` / the retry driver advance a run: a non-`End`
+    `next_node` enters the loop once, then the pre-set `result` makes the
+    driver break immediately. `next` is provided for completeness.
+    """
 
     def __init__(self, result: Any, messages: list[Any]) -> None:
         self.result = result
         self._messages = messages
+        self.next_node: Any = object()  # non-End sentinel
 
-    def __aiter__(self) -> _FakeRun:
-        return self
-
-    async def __anext__(self) -> Any:
-        raise StopAsyncIteration
+    async def next(self, node: Any) -> Any:
+        return End(self.result)
 
     def all_messages(self) -> list[Any]:
         return self._messages
@@ -129,14 +137,14 @@ class _FakeAgentCM:
 
 
 class FakeAgent:
-    """Faithful stand-in for a pydantic-ai ``Agent`` driven via ``.iter()``.
+    """Faithful stand-in for a pydantic-ai `Agent` driven via `.iter()`.
 
-    Mirrors how ``Agent.run`` is actually implemented (``async with
+    Mirrors how `Agent.run` is actually implemented (``async with
     agent.iter(...) as run``), so it exercises the real subagent
-    execution path. Construct with ``result`` (success), ``error``
-    (raised inside the run), and/or ``delay`` (await before resolving,
-    for cancellation tests). Every ``.iter()`` call is recorded in
-    ``iter_calls`` for assertions.
+    execution path. Construct with `result` (success), `error`
+    (raised inside the run), and/or `delay` (await before resolving,
+    for cancellation tests). Every `.iter()` call is recorded in
+    `iter_calls` for assertions.
     """
 
     def __init__(
@@ -232,7 +240,6 @@ class TestCompileSubagent:
 
     def test_compile_with_model_object(self):
         """Test compiling subagent with a Model object instead of string."""
-        from pydantic_ai.models.test import TestModel
 
         from subagents_pydantic_ai.toolset import _compile_subagent
 
@@ -250,7 +257,6 @@ class TestCompileSubagent:
 
     def test_compile_with_model_object_in_config(self):
         """Test compiling subagent with a Model object in SubAgentConfig."""
-        from pydantic_ai.models.test import TestModel
 
         from subagents_pydantic_ai.toolset import _compile_subagent
 
@@ -273,7 +279,6 @@ class TestCompileSubagent:
 
     def test_compile_with_custom_toolsets(self):
         """Test compiling subagent with custom toolsets."""
-        from pydantic_ai.toolsets import FunctionToolset
 
         from subagents_pydantic_ai.toolset import _compile_subagent
 
@@ -430,7 +435,6 @@ class TestCreateAskParentToolset:
     @pytest.mark.asyncio
     async def test_ask_parent_with_task_manager(self):
         """Test ask_parent with task_manager and answer future."""
-        import asyncio
 
         from subagents_pydantic_ai.message_bus import InMemoryMessageBus, TaskManager
         from subagents_pydantic_ai.types import TaskHandle, TaskStatus
@@ -1038,7 +1042,6 @@ class TestRunAsync:
     @pytest.mark.asyncio
     async def test_run_async_task_completes(self):
         """Test async task completes successfully."""
-        import asyncio
 
         from subagents_pydantic_ai import InMemoryMessageBus, TaskManager
 
@@ -1151,7 +1154,6 @@ class TestRunAsync:
     @pytest.mark.asyncio
     async def test_run_async_task_fails(self):
         """Test async task handles failure."""
-        import asyncio
 
         from subagents_pydantic_ai import InMemoryMessageBus, TaskManager
 
@@ -1880,8 +1882,6 @@ class TestToolsetFunctionsCoverage:
         )
 
         def mock_toolsets_factory(deps):
-            from pydantic_ai.toolsets import FunctionToolset
-
             return [FunctionToolset(id="mock")]
 
         with patch(
@@ -1922,8 +1922,6 @@ class TestToolsetFunctionsCoverage:
         )
 
         def mock_toolsets_factory(deps):
-            from pydantic_ai.toolsets import FunctionToolset
-
             return [FunctionToolset(id="mock")]
 
         with patch(
@@ -2524,9 +2522,9 @@ class TestToolsetFunctionsCoverage:
         """Cancelling wait_tasks must NOT cancel the workers it is waiting on.
 
         Regression for the silent-CANCELLED bug: the previous
-        ``asyncio.wait_for(asyncio.gather(...))`` propagated cancellation
-        through ``wait_for`` → ``gather`` → child tasks, so a sibling-cancel
-        from pydantic-ai's ``_call_tools`` (or any other outer cancel) would
+        `asyncio.wait_for(asyncio.gather(...))` propagated cancellation
+        through `wait_for` → `gather` → child tasks, so a sibling-cancel
+        from pydantic-ai's `_call_tools` (or any other outer cancel) would
         silently kill all in-flight subagents.
         """
         config = SubAgentConfig(name="worker", description="Worker", instructions="Work")
@@ -2819,7 +2817,6 @@ class TestCheckTaskStatusBranches:
     @pytest.mark.asyncio
     async def test_check_task_running_with_elapsed_time(self):
         """Test check_task shows elapsed time for running task with started_at."""
-        from datetime import datetime
 
         from subagents_pydantic_ai import InMemoryMessageBus
         from subagents_pydantic_ai.message_bus import TaskManager
@@ -3099,8 +3096,9 @@ class TestMessageBusBranchCoverage:
             status="running",
         )
 
-        # Register the worker agent
-        message_bus.register_agent("worker")
+        # The running subagent registers on the bus as `subagent-{task_id}`
+        # (see toolset.py), which is where the cancel request must be delivered.
+        message_bus.register_agent("subagent-task-1")
 
         async def long_task():
             cancel_event = task_manager.get_cancel_event("task-1")
@@ -3114,11 +3112,12 @@ class TestMessageBusBranchCoverage:
         result = await task_manager.soft_cancel("task-1")
         assert result is True
 
-        # Verify message was sent
-        queue = message_bus._queues["worker"]
+        # Verify message reached the subagent's registered queue.
+        queue = message_bus._queues["subagent-task-1"]
         msg = await asyncio.wait_for(queue.get(), timeout=1.0)
         assert msg.type == MessageType.CANCEL_REQUEST
         assert msg.task_id == "task-1"
+        assert msg.receiver == "subagent-task-1"
 
     @pytest.mark.asyncio
     async def test_hard_cancel_updates_handle_status(self):
@@ -3170,8 +3169,6 @@ class TestSerializeOutput:
         assert _serialize_output("hello") == "hello"
 
     def test_pydantic_model(self):
-        from pydantic import BaseModel
-
         from subagents_pydantic_ai.toolset import _serialize_output
 
         class MyModel(BaseModel):
@@ -3386,3 +3383,146 @@ class TestUsageTracking:
         result = await check_tool.function(ctx, "no-usage")
         assert "Result: done" in result
         assert "Usage:" not in result
+
+class TestDrainSteeringMessages:
+    """Unit tests for `_drain_steering_messages` (parent -> child steering)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_task_update_text_in_order(self):
+        from subagents_pydantic_ai.message_bus import InMemoryMessageBus
+        from subagents_pydantic_ai.toolset import _drain_steering_messages
+        from subagents_pydantic_ai.types import AgentMessage, MessageType
+
+        bus = InMemoryMessageBus()
+        bus.register_agent("subagent-x")
+        for text in ("first", "second"):
+            await bus.send(
+                AgentMessage(
+                    type=MessageType.TASK_UPDATE,
+                    sender="parent",
+                    receiver="subagent-x",
+                    payload={"message": text},
+                    task_id="x",
+                )
+            )
+
+        assert await _drain_steering_messages(bus, "subagent-x") == ["first", "second"]
+        # A second drain returns nothing — the queue was consumed.
+        assert await _drain_steering_messages(bus, "subagent-x") == []
+
+    @pytest.mark.asyncio
+    async def test_non_dict_payload_is_stringified(self):
+        from subagents_pydantic_ai.message_bus import InMemoryMessageBus
+        from subagents_pydantic_ai.toolset import _drain_steering_messages
+        from subagents_pydantic_ai.types import AgentMessage, MessageType
+
+        bus = InMemoryMessageBus()
+        bus.register_agent("subagent-x")
+        await bus.send(
+            AgentMessage(
+                type=MessageType.TASK_UPDATE,
+                sender="parent",
+                receiver="subagent-x",
+                payload="bare text",
+                task_id="x",
+            )
+        )
+
+        assert await _drain_steering_messages(bus, "subagent-x") == ["bare text"]
+
+    @pytest.mark.asyncio
+    async def test_ignores_other_types_and_empty_payloads(self):
+        from subagents_pydantic_ai.message_bus import InMemoryMessageBus
+        from subagents_pydantic_ai.toolset import _drain_steering_messages
+        from subagents_pydantic_ai.types import AgentMessage, MessageType
+
+        bus = InMemoryMessageBus()
+        bus.register_agent("subagent-x")
+        # A non-steering message type — ignored.
+        await bus.send(
+            AgentMessage(
+                type=MessageType.CANCEL_REQUEST,
+                sender="task_manager",
+                receiver="subagent-x",
+                payload={"reason": "soft_cancel"},
+                task_id="x",
+            )
+        )
+        # A steering message with an empty body — skipped.
+        await bus.send(
+            AgentMessage(
+                type=MessageType.TASK_UPDATE,
+                sender="parent",
+                receiver="subagent-x",
+                payload={"message": ""},
+                task_id="x",
+            )
+        )
+
+        assert await _drain_steering_messages(bus, "subagent-x") == []
+
+
+class TestSendMessageToSubagent:
+    """Tests for the `send_message_to_subagent` parent-facing tool."""
+
+    def _make_toolset(self):
+        config = SubAgentConfig(name="helper", description="Helps", instructions="Help")
+        with patch(
+            "subagents_pydantic_ai.toolset._compile_subagent",
+            return_value=_make_mock_compiled_subagent(config),
+        ):
+            return create_subagent_toolset(subagents=[config], include_general_purpose=False)
+
+    @pytest.mark.asyncio
+    async def test_registered_in_toolset(self):
+        toolset = self._make_toolset()
+        assert "send_message_to_subagent" in toolset.tools
+
+    @pytest.mark.asyncio
+    async def test_task_not_found(self):
+        toolset = self._make_toolset()
+        tool = toolset.tools["send_message_to_subagent"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        result = await tool.function(ctx, "nope", "do this")
+        assert "Error" in result
+        assert "not found" in result
+
+    @pytest.mark.asyncio
+    async def test_task_not_running(self):
+        from subagents_pydantic_ai.types import TaskHandle
+
+        toolset = self._make_toolset()
+        tm = toolset.task_manager
+        # A finished task: a handle exists, but the subagent is not registered
+        # on the bus (it unregisters when done).
+        tm.handles["done-1"] = TaskHandle(
+            task_id="done-1",
+            subagent_name="helper",
+            description="d",
+            status=TaskStatus.COMPLETED,
+        )
+        tool = toolset.tools["send_message_to_subagent"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        result = await tool.function(ctx, "done-1", "too late")
+        assert "Error" in result
+        assert "not accepting messages" in result
+
+    @pytest.mark.asyncio
+    async def test_delivers_to_running_subagent(self):
+        from subagents_pydantic_ai.types import MessageType
+
+        toolset = self._make_toolset()
+        bus = toolset.task_manager.message_bus
+        bus.register_agent("subagent-run-1")
+        tool = toolset.tools["send_message_to_subagent"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        result = await tool.function(ctx, "run-1", "narrow the scope")
+        assert "delivered" in result
+
+        msgs = await bus.get_messages("subagent-run-1")
+        assert len(msgs) == 1
+        assert msgs[0].type == MessageType.TASK_UPDATE
+        assert msgs[0].payload == {"message": "narrow the scope"}

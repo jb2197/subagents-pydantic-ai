@@ -129,6 +129,40 @@ Answer a question from a blocked subagent.
 answer_subagent(task_id="abc123", answer="Use PostgreSQL for this project")
 ```
 
+### send_message_to_subagent
+
+Steer a running **async** subagent mid-flight, without cancelling it. Use this
+when you learn something new while a long task is in progress and want to
+redirect or narrow it — the subagent keeps all its partial progress.
+
+```python
+# The agent calls:
+send_message_to_subagent(
+    task_id="abc123",
+    message="narrow the search to packages/sparta/ — it isn't in core/",
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `task_id` | `str` | Task ID of the running async subagent |
+| `message` | `str` | Steering instruction to deliver |
+
+The message is folded into the subagent's **next model request** as an extra
+user instruction, so it adapts on its next step. This is unprompted parent ->
+child steering, distinct from `answer_subagent` (which only replies to a
+question the subagent already asked via `ask_parent`). It applies to async
+tasks that are still running; messages to a finished or unknown task return an
+error.
+
+!!! note
+    Steering is delivered at model-request boundaries on the retry-driven run
+    path, which is the default (`max_retries > 0`). If you explicitly set
+    `max_retries=0` on a subagent, it runs via the legacy single-shot path and
+    steering messages stay queued instead of being applied.
+
 ### list_active_tasks
 
 List all running background tasks.
@@ -303,25 +337,40 @@ Only the tool names you include in the dictionary are overridden; the rest keep 
 Add context about available subagents to your agent's system prompt:
 
 ```python
-from subagents_pydantic_ai import get_subagent_system_prompt
+from subagents_pydantic_ai import SubAgentConfig, get_subagent_system_prompt
+
+configs = [
+    SubAgentConfig(
+        name="researcher",
+        description="Researches topics and gathers information",
+        instructions="You are a research assistant.",
+    ),
+    SubAgentConfig(
+        name="writer",
+        description="Writes content based on research",
+        instructions="You are a writer.",
+    ),
+]
 
 # Generate prompt listing available subagents
-prompt = get_subagent_system_prompt(deps, compiled_subagents)
+prompt = get_subagent_system_prompt(configs)
 ```
 
-This generates text like:
+The [`get_subagent_system_prompt`][subagents_pydantic_ai.prompts.get_subagent_system_prompt]
+function takes a list of [`SubAgentConfig`][subagents_pydantic_ai.types.SubAgentConfig]
+dicts (not deps) and an optional `include_dual_mode` flag. It generates text like:
 
 ```
 ## Available Subagents
 
-You can delegate tasks to these specialized subagents:
+Use the `task` tool to delegate work to these subagents:
 
 - **researcher**: Researches topics and gathers information
 - **writer**: Writes content based on research
-- **coder**: Writes and tests Python code
-
-Use the `task` tool to delegate work.
 ```
+
+Subagents configured with `can_ask_questions=False` are annotated with
+*(cannot ask clarifying questions)*.
 
 ## Next Steps
 

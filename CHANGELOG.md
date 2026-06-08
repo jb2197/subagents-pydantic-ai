@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7] - 2026-06-04
+
+### Added
+
+- **Unprompted parent -> child steering via `send_message_to_subagent`** ([#28](https://github.com/vstorm-co/subagents-pydantic-ai/issues/28)). A parent agent can now steer a running **async** subagent mid-flight without cancelling it — e.g. "narrow the search to `packages/sparta/`, it isn't in `core/`" — so the subagent adapts on its next step while keeping all partial progress, instead of the lossy cancel-and-respawn pattern. The new `send_message_to_subagent(task_id, message)` tool enqueues a `TASK_UPDATE` on the message bus for `subagent-{task_id}`; the run loop drains it at the next model-request boundary (`_drive_run` gained an `inject_messages` hook alongside the existing `cancel_check`) and folds each message into that request as an extra `UserPromptPart`. Injecting only at model-request boundaries guarantees a steering part is never spliced into a tool-call/tool-return pair. This is distinct from `answer_subagent`, which only replies to a question the subagent already asked via `ask_parent`. Sending to a finished or unknown task returns a clear error. Honoured on the retry-driven run path (`max_retries > 0`, the default); the legacy `agent.run()` fast path (`max_retries == 0`) does not expose node boundaries, so steering messages stay queued there.
+
+## [0.2.6] - 2026-06-01
+
+### Changed
+
+- **Docstring and import hygiene (internal; no behavior change).** Converted reStructuredText-style double-backtick inline code in docstrings and comments to single-backtick Markdown (185 occurrences), so it renders correctly under the mkdocstrings Markdown handler. Hoisted 27 function-local imports to module top where safe; intentionally-lazy, conditional, optional-dependency (`try`/`except ImportError`), and circular-import-avoidance imports were left in place.
+
+### Fixed
+
+- **Retry path skipped node lifecycle hooks without a streaming consumer** (`retry.py`). The no-streaming branch of `_drive_run` advanced the run with a bare `async for _ in run` (`AgentRun.__anext__`), which fires none of the node hooks (`before_node_run` / `after_node_run` / `wrap_node_run` / `on_node_run_error`). With the default `max_retries=3`, any capability that recovers from a node error via `on_node_run_error` was therefore bypassed. The no-streaming branch now drives via `run.next(node)` exactly like `Agent.run` (hooks fire; no streaming overhead).
+- **`soft_cancel` sent the cancel request to an unregistered receiver** (`message_bus.py`). It addressed `handle.subagent_name` (e.g. `"researcher"`), but the running subagent registers on the bus as `subagent-{task_id}`, so the send raised a swallowed `KeyError` and the cooperative-cancel message never arrived. Now sends to `subagent-{task_id}`.
+- **`create_agent` tool had no description** (`factory.py`). The function body opened with an f-string instead of a string literal, so `__doc__` was `None` and the computed allowed-models / capabilities text was evaluated and discarded on every call. The model-facing description (with models / capabilities / default model interpolated) is now supplied via the `@toolset.tool(description=...)` decorator, and the function carries a normal docstring.
+- **Soft cancellation was non-functional - the cancel event was never consumed** (`retry.py`, `toolset.py`). `soft_cancel` set a per-task `asyncio.Event` and sent a `CANCEL_REQUEST`, but nothing in the subagent run path ever checked it, so `soft_cancel` reported success while the task kept running. `run_with_retry`/`_drive_run` now accept an optional `cancel_check` callable that is polled between graph nodes; `run_task` wires it to the task's cancel event so a soft-cancelled subagent stops cooperatively at the next node boundary (raising `asyncio.CancelledError`, which surfaces as `TaskStatus.CANCELLED`). Honoured on the retry-driven path (`max_retries > 0`); the legacy `agent.run()` fast path (`max_retries == 0`) does not expose node boundaries, so soft cancel is best-effort there.
+- **`create_agent` silently dropped capabilities with a custom `default_agent_factory`** (`factory.py`). When a custom `default_agent_factory` was configured the factory was called with only `config`, so any requested capabilities/toolsets were discarded even though the success message still reported them as enabled. `create_agent` now returns an error when capabilities are requested alongside a custom factory, since the factory owns the whole agent build and cannot receive injected toolsets.
+- **`create_task` assigned a raw string status instead of the enum** (`message_bus.py`). It set `handle.status = "running"` rather than `TaskStatus.RUNNING`; equal via the str-Enum but inconsistent with the rest of the code and breaking any `isinstance(status, TaskStatus)` check. Now assigns `TaskStatus.RUNNING`.
+- **`hard_cancel` clobbered the outcome of an already-finished task** (`message_bus.py`). It unconditionally set `handle.status = "cancelled"` and `completed_at` even when the task had already completed or failed, overwriting the real outcome and racing with `run_task`'s teardown. The handle update is now guarded under `not task.done()`, so a finished task keeps its `COMPLETED`/`FAILED` status and `completed_at`.
+
+### Documentation
+
+- **Documentation accuracy pass and new pages.** Fixed the wrong `get_subagent_system_prompt` signature and sample output, corrected the dynamic-agents factory defaults (`default_model="openai:gpt-4.1"`) and its missing options, and corrected the `can_ask_questions`/`max_questions` defaults in the config reference. Added a new **Retries** guide and API entries for `SubAgentSpec`, `UsageLimitsFactory`, `AskUserCallback`, the prompt/description constants, and the retry helpers (`RetryConfig`, `run_with_retry`, `is_transient_error`, `compute_backoff_delay`); completed the `create_subagent_toolset` tool list (added `wait_tasks`). Documented the `SubAgentCapability` `ask_user` limitation, usage limits, and the `max_nesting_depth`/`clone_for_subagent` deps contract, and clarified the `Agent.from_file` / `SubAgentSpec` YAML-loading paths. `mkdocs build --strict` passes with zero warnings.
+
 ## [0.2.5] - 2026-05-24
 
 ### Infrastructure
