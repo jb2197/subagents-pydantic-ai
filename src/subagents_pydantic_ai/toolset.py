@@ -11,6 +11,7 @@ import asyncio
 import uuid
 from collections.abc import Callable
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic_ai import Agent, RunContext, UsageLimits
@@ -82,6 +83,71 @@ def _capture_message_history(
     messages: Any = all_messages()
     if messages:
         on_message_history(list(messages))
+
+
+def _get_result_traceparent(result: Any) -> str | None:
+    traceparent = getattr(result, "_traceparent", None)
+    if traceparent is None:
+        return None
+
+    value = traceparent(required=False)
+    return value if isinstance(value, str) and value else None
+
+
+def _iter_model_responses(result: Any) -> list[Any]:
+    responses: list[Any] = []
+    for message in result.all_messages():
+        if getattr(message, "kind", None) == "response":
+            responses.append(message)
+
+    try:
+        response = result.response
+    except (AttributeError, ValueError):
+        response = None
+    if response is not None and all(response is not item for item in responses):
+        responses.append(response)
+    return responses
+
+
+def _capture_result_observability(handle: TaskHandle, result: Any) -> None:
+    """Copy result observability onto a task handle."""
+    handle.usage = result.usage
+    handle.message_history = result.all_messages_json().decode()
+    handle.run_id = result.run_id
+    handle.conversation_id = result.conversation_id
+
+    handle.traceparent = _get_result_traceparent(result)
+    if handle.traceparent is not None:
+        parts = handle.traceparent.split("-")
+        if len(parts) >= 4:
+            handle.trace_id = parts[1]
+            handle.span_id = parts[2]
+
+    responses = _iter_model_responses(result)
+    if responses:
+        response = responses[-1]
+        handle.model_name = response.model_name
+        handle.provider_name = response.provider_name
+        handle.provider_url = response.provider_url
+        handle.provider_response_id = response.provider_response_id
+        handle.provider_details = response.provider_details
+        handle.finish_reason = response.finish_reason
+
+    total_cost = Decimal("0")
+    has_cost = False
+    tool_call_counts: dict[str, int] = {}
+    for response in responses:
+        try:
+            total_cost += response.cost().total_price
+            has_cost = True
+        except (AssertionError, LookupError):
+            pass
+
+        for tool_call in response.tool_calls:
+            tool_call_counts[tool_call.tool_name] = tool_call_counts.get(tool_call.tool_name, 0) + 1
+
+    handle.cost = total_cost if has_cost else None
+    handle.tool_call_counts = tool_call_counts
 
 
 def _format_chat_trace_result(output: str, chat_trace_id: str) -> str:
@@ -809,6 +875,8 @@ async def _run_sync(
         run_kwargs["usage_limits"] = usage_limits
     if message_history is not None:
         run_kwargs["message_history"] = message_history
+    if handle is not None and handle.chat_trace_id is not None:
+        run_kwargs["conversation_id"] = handle.chat_trace_id
 
     try:
         result = await run_with_retry(
@@ -822,8 +890,7 @@ async def _run_sync(
         if handle is not None:
             handle.result = output
             handle.error = None
-            handle.usage = result.usage
-            handle.message_history = result.all_messages_json().decode()
+            _capture_result_observability(handle, result)
             handle.status = TaskStatus.COMPLETED
             handle.completed_at = datetime.now()
         return output
@@ -914,6 +981,8 @@ async def _run_async(
             run_kwargs["usage_limits"] = usage_limits
         if message_history is not None:
             run_kwargs["message_history"] = message_history
+        if chat_trace_id is not None:
+            run_kwargs["conversation_id"] = chat_trace_id
 
         def _on_retry(attempt: int, exc: BaseException, delay: float) -> None:
             handle.status = TaskStatus.RETRYING
@@ -944,8 +1013,7 @@ async def _run_async(
             _capture_message_history(result, on_message_history)
             handle.result = _serialize_output(result.output)
             handle.error = None
-            handle.usage = result.usage
-            handle.message_history = result.all_messages_json().decode()
+            _capture_result_observability(handle, result)
             handle.status = TaskStatus.COMPLETED
         except asyncio.CancelledError:
             handle.status = TaskStatus.CANCELLED

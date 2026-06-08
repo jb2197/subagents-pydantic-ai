@@ -6,6 +6,8 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,6 +20,7 @@ from pydantic_graph import End
 
 from subagents_pydantic_ai import SubAgentConfig, create_subagent_toolset
 from subagents_pydantic_ai.toolset import (
+    _capture_result_observability,
     _create_ask_parent_toolset,
     _create_general_purpose_config,
     _run_async,
@@ -77,10 +80,16 @@ class MockResult:
         *,
         usage: MockUsage | None = None,
         messages: list[Any] | None = None,
+        run_id: str = "run-123",
+        conversation_id: str = "conversation-123",
+        traceparent: str | None = None,
     ):
         self.output = output
         self._usage = usage or MockUsage()
         self._messages = messages or []
+        self.run_id = run_id
+        self.conversation_id = conversation_id
+        self._traceparent_value = traceparent
 
     @property
     def usage(self) -> MockUsage:
@@ -90,7 +99,12 @@ class MockResult:
         return self._messages
 
     def all_messages_json(self) -> bytes:
-        return json.dumps(self._messages).encode()
+        return json.dumps(self._messages, default=str).encode()
+
+    def _traceparent(self, *, required: bool = True) -> str | None:
+        if self._traceparent_value is None and required:
+            raise AttributeError("No span was created for this agent run")
+        return self._traceparent_value
 
 
 class MockResultWithMessages(MockResult):
@@ -98,6 +112,32 @@ class MockResultWithMessages(MockResult):
 
     def __init__(self, output: Any = "mock result", messages: list[Any] | None = None):
         super().__init__(output, messages=messages)
+
+
+class MockModelResponse:
+    """Minimal pydantic-ai ModelResponse stand-in for observability tests."""
+
+    kind = "response"
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        provider_name: str,
+        total_price: Decimal,
+        tool_names: list[str] | None = None,
+    ):
+        self.model_name = model_name
+        self.provider_name = provider_name
+        self.provider_url = "https://example.test/v1"
+        self.provider_response_id = "provider-response-123"
+        self.provider_details = {"region": "test"}
+        self.finish_reason = "stop"
+        self.tool_calls = [SimpleNamespace(tool_name=name) for name in tool_names or []]
+        self._total_price = total_price
+
+    def cost(self) -> Any:
+        return SimpleNamespace(total_price=self._total_price)
 
 
 class _FakeRun:
@@ -967,6 +1007,53 @@ class TestRunSync:
         )
 
         assert not hasattr(deps, "_subagent_state")
+
+
+class TestResultObservability:
+    """Tests for copying AgentRunResult observability onto task handles."""
+
+    def test_capture_result_observability(self):
+        first_response = MockModelResponse(
+            model_name="gpt-first",
+            provider_name="openai",
+            total_price=Decimal("0.01"),
+            tool_names=["search", "task"],
+        )
+        second_response = MockModelResponse(
+            model_name="gpt-second",
+            provider_name="openai",
+            total_price=Decimal("0.02"),
+            tool_names=["search"],
+        )
+        result = MockResult(
+            "done",
+            messages=[first_response, second_response],
+            run_id="run-abc",
+            conversation_id="conversation-abc",
+            traceparent="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )
+        handle = TaskHandle(
+            task_id="task-123",
+            subagent_name="test",
+            description="do the thing",
+        )
+
+        _capture_result_observability(handle, result)
+
+        assert handle.usage is result.usage
+        assert handle.message_history is not None
+        assert handle.run_id == "run-abc"
+        assert handle.conversation_id == "conversation-abc"
+        assert handle.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736"
+        assert handle.span_id == "00f067aa0ba902b7"
+        assert handle.model_name == "gpt-second"
+        assert handle.provider_name == "openai"
+        assert handle.provider_url == "https://example.test/v1"
+        assert handle.provider_response_id == "provider-response-123"
+        assert handle.provider_details == {"region": "test"}
+        assert handle.finish_reason == "stop"
+        assert handle.cost == Decimal("0.03")
+        assert handle.tool_call_counts == {"search": 2, "task": 1}
 
 
 class TestRunAsync:
