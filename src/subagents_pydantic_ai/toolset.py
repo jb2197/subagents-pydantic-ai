@@ -71,7 +71,7 @@ def _capture_message_history(
     result: Any,
     on_message_history: Callable[[list[Any]], None] | None,
 ) -> None:
-    """Capture a successful run's message history for a session."""
+    """Capture a successful run's message history for a chat trace."""
     if on_message_history is None:
         return
 
@@ -84,13 +84,13 @@ def _capture_message_history(
         on_message_history(list(messages))
 
 
-def _format_session_result(output: str, session_id: str) -> str:
-    """Append session continuation instructions to a subagent result."""
+def _format_chat_trace_result(output: str, chat_trace_id: str) -> str:
+    """Append chat trace continuation instructions to a subagent result."""
     return (
         f"{output}\n\n"
-        f"Session ID: {session_id}\n"
-        "To continue this subagent conversation, pass this session_id to task(). "
-        "Omit session_id to start a new conversation."
+        f"Chat Trace ID: {chat_trace_id}\n"
+        "To continue this subagent conversation, pass this chat_trace_id to task(). "
+        "Omit chat_trace_id to start a new conversation."
     )
 
 
@@ -374,7 +374,7 @@ def create_subagent_toolset(  # noqa: C901
         complexity: Literal["simple", "moderate", "complex"] | None = None,
         requires_user_context: bool = False,
         may_need_clarification: bool = False,
-        session_id: str | None = None,
+        chat_trace_id: str | None = None,
     ) -> str:
         """Delegate a task to a specialized subagent.
 
@@ -387,9 +387,9 @@ def create_subagent_toolset(  # noqa: C901
             complexity: Override complexity estimate ("simple", "moderate", "complex").
             requires_user_context: Whether task needs ongoing user interaction.
             may_need_clarification: Whether task might need clarifying questions.
-            session_id: Optional explicit session ID. When omitted, a new subagent
+            chat_trace_id: Optional explicit chat trace ID. When omitted, a new subagent
                 conversation is created. When provided, this subagent resumes from
-                the previous successful task with the same session.
+                the previous successful task with the same chat trace.
         """
         # Validate subagent_type — check static compiled dict first, then dynamic registry
         if subagent_type in compiled:
@@ -428,12 +428,12 @@ def create_subagent_toolset(  # noqa: C901
         # Generate task ID
         task_id = str(uuid.uuid4())[:8]
 
-        effective_session_id = session_id or str(uuid.uuid4())[:8]
-        session_key = (config["name"], effective_session_id)
-        message_history = message_history_store.get(session_key)
+        effective_chat_trace_id = chat_trace_id or str(uuid.uuid4())[:8]
+        chat_trace_key = (config["name"], effective_chat_trace_id)
+        message_history = message_history_store.get(chat_trace_key)
 
         def save_message_history(messages: list[Any]) -> None:
-            message_history_store[session_key] = messages
+            message_history_store[chat_trace_key] = messages
 
         # Resolve mode if "auto"
         if mode == "auto":
@@ -454,7 +454,7 @@ def create_subagent_toolset(  # noqa: C901
                 description=description,
                 status=TaskStatus.RUNNING,
                 priority=priority,
-                session_id=effective_session_id,
+                chat_trace_id=effective_chat_trace_id,
                 started_at=datetime.now(),
             )
             task_manager.handles[task_id] = handle
@@ -471,7 +471,7 @@ def create_subagent_toolset(  # noqa: C901
                 message_history=message_history,
                 on_message_history=save_message_history,
             )
-            return _format_session_result(result, effective_session_id)
+            return _format_chat_trace_result(result, effective_chat_trace_id)
         else:
             return await _run_async(
                 agent=agent,
@@ -484,7 +484,7 @@ def create_subagent_toolset(  # noqa: C901
                 extra_toolsets=runtime_toolsets,
                 priority=priority,
                 usage_limits=resolved_usage_limits,
-                session_id=effective_session_id,
+                chat_trace_id=effective_chat_trace_id,
                 message_history=message_history,
                 on_message_history=save_message_history,
             )
@@ -510,8 +510,8 @@ def create_subagent_toolset(  # noqa: C901
             f"Status: {handle.status}",
             f"Description: {handle.description}",
         ]
-        if handle.session_id is not None:
-            status_info.append(f"Session ID: {handle.session_id}")
+        if handle.chat_trace_id is not None:
+            status_info.append(f"Chat Trace ID: {handle.chat_trace_id}")
 
         if handle.status == TaskStatus.COMPLETED:
             status_info.append(f"Result: {handle.result}")
@@ -666,12 +666,12 @@ def create_subagent_toolset(  # noqa: C901
             if status == "completed":
                 finished_count += 1
                 result_preview = (handle.result or "")[:2000]
-                session_line = (
-                    f"Session ID: {handle.session_id}\n" if handle.session_id is not None else ""
-                )
+                chat_trace_line = ""
+                if handle.chat_trace_id is not None:
+                    chat_trace_line = f"Chat Trace ID: {handle.chat_trace_id}\n"
                 lines.append(
                     f"- {tid} ({handle.subagent_name}): COMPLETED\n"
-                    f"{session_line}{result_preview}"
+                    f"{chat_trace_line}{result_preview}"
                 )
             elif status == "failed":
                 finished_count += 1
@@ -781,7 +781,7 @@ async def _run_sync(
         usage_limits: Optional pydantic-ai usage limits forwarded to the
             subagent run (honoured on every retry attempt).
         handle: Optional task handle populated for Python-side observability.
-        message_history: Optional prior message history for a subagent session.
+        message_history: Optional prior message history for a subagent chat trace.
         on_message_history: Optional callback that receives the successful
             run's full message history.
 
@@ -846,7 +846,7 @@ async def _run_async(
     priority: TaskPriority = TaskPriority.NORMAL,
     extra_toolsets: list[Any] | None = None,
     usage_limits: UsageLimits | None = None,
-    session_id: str | None = None,
+    chat_trace_id: str | None = None,
     message_history: list[Any] | None = None,
     on_message_history: Callable[[list[Any]], None] | None = None,
 ) -> str:
@@ -864,9 +864,9 @@ async def _run_async(
         extra_toolsets: Additional toolsets to pass to agent.run().
         usage_limits: Optional pydantic-ai usage limits forwarded to the
             subagent run (honoured on every retry attempt).
-        session_id: Optional session ID for continuing this subagent
+        chat_trace_id: Optional chat trace ID for continuing this subagent
             conversation.
-        message_history: Optional prior message history for a subagent session.
+        message_history: Optional prior message history for a subagent chat trace.
         on_message_history: Optional callback that receives the successful
             run's full message history.
 
@@ -880,7 +880,7 @@ async def _run_async(
         description=description,
         status=TaskStatus.PENDING,
         priority=priority,
-        session_id=session_id,
+        chat_trace_id=chat_trace_id,
     )
 
     # Register subagent for messaging
@@ -967,11 +967,11 @@ async def _run_async(
         f"Task ID: {task_id}\n"
         f"Subagent: {config['name']}\n"
     )
-    if session_id is not None:
+    if chat_trace_id is not None:
         response += (
-            f"Session ID: {session_id}\n"
-            "To continue this subagent conversation, pass this session_id to task(). "
-            "Omit session_id to start a new conversation.\n"
+            f"Chat Trace ID: {chat_trace_id}\n"
+            "To continue this subagent conversation, pass this chat_trace_id to task(). "
+            "Omit chat_trace_id to start a new conversation.\n"
         )
     response += f"Use check_task('{task_id}') to check status."
     return response

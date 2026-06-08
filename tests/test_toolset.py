@@ -1004,7 +1004,7 @@ class TestRunAsync:
 
     @pytest.mark.asyncio
     async def test_run_async_resumes_and_captures_message_history(self):
-        """Explicit sessions can seed and update async subagent history."""
+        """Explicit chat traces can seed and update async subagent history."""
         from subagents_pydantic_ai import InMemoryMessageBus, TaskManager
 
         seed_history = [{"role": "assistant", "content": "previous"}]
@@ -1220,11 +1220,11 @@ class TestToolsetIntegration:
             ctx = MockRunContext(deps=MockDeps())
             result = await task_tool.function(ctx, "do something", "helper", "sync")
 
-            assert result.startswith("Sync result\n\nSession ID: ")
+            assert result.startswith("Sync result\n\nChat Trace ID: ")
             handle = mock_run_sync.call_args.kwargs["handle"]
             assert handle.task_id in toolset.task_manager.handles  # type: ignore[attr-defined]
-            assert handle.session_id in result
-            assert "pass this session_id to task()" in result
+            assert handle.chat_trace_id in result
+            assert "pass this chat_trace_id to task()" in result
 
     @pytest.mark.asyncio
     async def test_task_sync_forwards_ask_user(self):
@@ -1294,8 +1294,8 @@ class TestToolsetIntegration:
             assert "Task started" in result
 
     @pytest.mark.asyncio
-    async def test_task_session_reuses_message_history(self):
-        """task(session_id=...) stores and reuses history for that subagent."""
+    async def test_task_chat_trace_reuses_message_history(self):
+        """task(chat_trace_id=...) stores and reuses history for that subagent."""
         config = SubAgentConfig(
             name="worker",
             description="Does work",
@@ -1327,25 +1327,25 @@ class TestToolsetIntegration:
                 "remember this",
                 "worker",
                 "sync",
-                session_id="session-1",
+                chat_trace_id="trace-1",
             )
             second = await task_tool.function(
                 ctx,
                 "continue",
                 "worker",
                 "sync",
-                session_id="session-1",
+                chat_trace_id="trace-1",
             )
 
-            assert first.startswith("done\n\nSession ID: session-1")
-            assert second.startswith("done\n\nSession ID: session-1")
+            assert first.startswith("done\n\nChat Trace ID: trace-1")
+            assert second.startswith("done\n\nChat Trace ID: trace-1")
             assert mock_agent.iter_calls[0]["message_history"] is None
             assert mock_agent.iter_calls[1]["message_history"] == saved_history
-            assert toolset.message_history_store[("worker", "session-1")] == saved_history
+            assert toolset.message_history_store[("worker", "trace-1")] == saved_history
 
     @pytest.mark.asyncio
-    async def test_task_without_session_creates_saved_session(self):
-        """Omitting session_id starts a new saved subagent conversation."""
+    async def test_task_without_chat_trace_id_creates_saved_trace(self):
+        """Omitting chat_trace_id starts a new saved subagent conversation."""
         config = SubAgentConfig(
             name="worker",
             description="Does work",
@@ -1373,26 +1373,26 @@ class TestToolsetIntegration:
             ctx = MockRunContext(deps=MockDeps())
 
             first = await task_tool.function(ctx, "remember this", "worker", "sync")
-            first_session_id = first.split("Session ID: ")[1].split("\n")[0]
+            first_chat_trace_id = first.split("Chat Trace ID: ")[1].split("\n")[0]
             second = await task_tool.function(ctx, "fresh task", "worker", "sync")
-            second_session_id = second.split("Session ID: ")[1].split("\n")[0]
+            second_chat_trace_id = second.split("Chat Trace ID: ")[1].split("\n")[0]
             continued = await task_tool.function(
                 ctx,
                 "continue first",
                 "worker",
                 "sync",
-                session_id=first_session_id,
+                chat_trace_id=first_chat_trace_id,
             )
 
-            assert first_session_id
-            assert second_session_id
-            assert second_session_id != first_session_id
-            assert continued.startswith(f"done\n\nSession ID: {first_session_id}")
+            assert first_chat_trace_id
+            assert second_chat_trace_id
+            assert second_chat_trace_id != first_chat_trace_id
+            assert continued.startswith(f"done\n\nChat Trace ID: {first_chat_trace_id}")
             assert mock_agent.iter_calls[0]["message_history"] is None
             assert mock_agent.iter_calls[1]["message_history"] is None
             assert mock_agent.iter_calls[2]["message_history"] == saved_history
-            assert toolset.message_history_store[("worker", first_session_id)] == saved_history
-            assert toolset.message_history_store[("worker", second_session_id)] == saved_history
+            assert toolset.message_history_store[("worker", first_chat_trace_id)] == saved_history
+            assert toolset.message_history_store[("worker", second_chat_trace_id)] == saved_history
 
 
 class TestAutoModeSelection:
@@ -1437,7 +1437,7 @@ class TestAutoModeSelection:
                 False,  # may_need_clarification
             )
 
-            assert result.startswith("Sync result\n\nSession ID: ")
+            assert result.startswith("Sync result\n\nChat Trace ID: ")
             mock_sync.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1521,7 +1521,7 @@ class TestAutoModeSelection:
                 False,  # may_need_clarification
             )
 
-            assert result.startswith("Sync result\n\nSession ID: ")
+            assert result.startswith("Sync result\n\nChat Trace ID: ")
             mock_sync.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1600,7 +1600,7 @@ class TestAutoModeSelection:
                 "auto",  # auto mode - uses config's typical_complexity
             )
 
-            assert result.startswith("Sync result\n\nSession ID: ")
+            assert result.startswith("Sync result\n\nChat Trace ID: ")
             mock_sync.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1641,7 +1641,7 @@ class TestAutoModeSelection:
                 "auto",
             )
 
-            assert result.startswith("Sync result\n\nSession ID: ")
+            assert result.startswith("Sync result\n\nChat Trace ID: ")
             mock_sync.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1683,7 +1683,7 @@ class TestAutoModeSelection:
                 "complex",  # Would normally be async
             )
 
-            assert result.startswith("Sync result\n\nSession ID: ")
+            assert result.startswith("Sync result\n\nChat Trace ID: ")
             mock_sync.assert_called_once()
 
 
