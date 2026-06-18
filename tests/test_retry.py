@@ -36,8 +36,13 @@ from subagents_pydantic_ai import (
     is_transient_error,
     run_with_retry,
 )
-from subagents_pydantic_ai.toolset import _run_async
-from subagents_pydantic_ai.types import AgentMessage, MessageType, SubAgentConfig
+from subagents_pydantic_ai.toolset import _run_async, _run_sync
+from subagents_pydantic_ai.types import (
+    AgentMessage,
+    MessageType,
+    SubAgentConfig,
+    TaskHandle,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -519,6 +524,62 @@ async def test_run_async_retries_then_completes() -> None:
     assert handle.retry_count == 1
     # Transient error message cleared after eventual success.
     assert handle.error is None
+
+
+async def test_run_async_completes_when_observability_attrs_missing() -> None:
+    """A result lacking observability attributes (`run_id`/`conversation_id`/
+    `all_messages`) must still complete: telemetry capture is best-effort and
+    must never flip a successful run to FAILED."""
+    agent = ScriptedAgent([{"result": FakeResult("done", usage=None)}])
+    config = SubAgentConfig(name="t", description="d", instructions="i")
+    bus = InMemoryMessageBus()
+    tm = TaskManager(message_bus=bus)
+
+    await _run_async(
+        agent=agent,
+        config=config,
+        description="do it",
+        deps=FakeDeps(),
+        task_id="task-obs",
+        task_manager=tm,
+        message_bus=bus,
+    )
+    await asyncio.sleep(0.05)
+
+    handle = tm.get_handle("task-obs")
+    assert handle is not None
+    assert handle.status == TaskStatus.COMPLETED
+    assert handle.result == "done"
+    assert handle.error is None
+    # Capture aborted on the missing attribute, so run_id was never set.
+    assert handle.run_id is None
+
+
+async def test_run_sync_failure_marks_handle_failed() -> None:
+    """`_run_sync`'s failure path marks the handle FAILED and returns an error string."""
+    agent = ScriptedAgent([{"iter_raise": ModelHTTPError(503, "m")}])
+    config = SubAgentConfig(
+        name="t",
+        description="d",
+        instructions="i",
+        max_retries=0,
+        retry_initial_delay=0.0,
+        retry_jitter=False,
+    )
+    handle = TaskHandle(task_id="task-sync-fail", subagent_name="t", description="do it")
+
+    result = await _run_sync(
+        agent=agent,
+        config=config,
+        description="do it",
+        deps=FakeDeps(),
+        task_id="task-sync-fail",
+        handle=handle,
+    )
+
+    assert handle.status == TaskStatus.FAILED
+    assert handle.error is not None
+    assert result.startswith("Error executing task:")
 
 
 async def test_run_async_retries_exhausted_fails() -> None:

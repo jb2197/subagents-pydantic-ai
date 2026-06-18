@@ -8,6 +8,7 @@ execution modes, with automatic mode selection based on task characteristics.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import Callable
 from datetime import datetime
@@ -49,6 +50,8 @@ from subagents_pydantic_ai.types import (
     UsageLimitsFactory,
     decide_execution_mode,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _serialize_output(output: Any) -> str:
@@ -125,6 +128,8 @@ def _capture_result_observability(handle: TaskHandle, result: Any) -> None:
 
     responses = _iter_model_responses(result)
     if responses:
+        # Model/provider metadata reflects the last response (the model that
+        # produced the final output); `cost`/`tool_call_counts` below sum across all.
         response = responses[-1]
         handle.model_name = response.model_name
         handle.provider_name = response.provider_name
@@ -148,6 +153,20 @@ def _capture_result_observability(handle: TaskHandle, result: Any) -> None:
 
     handle.cost = total_cost if has_cost else None
     handle.tool_call_counts = tool_call_counts
+
+
+def _capture_observability_best_effort(handle: TaskHandle, result: Any) -> None:
+    """Capture telemetry without ever failing the task.
+
+    Observability is best-effort (matching pydantic-ai's own instrumentation,
+    which warns on cost/serialization failures rather than propagating). A run
+    that succeeded must not be reported as ``FAILED`` just because a result
+    object lacks an attribute or telemetry collection raised.
+    """
+    try:
+        _capture_result_observability(handle, result)
+    except Exception as e:
+        logger.warning("Failed to capture subagent observability: %s", e)
 
 
 def _format_chat_trace_result(output: str, chat_trace_id: str) -> str:
@@ -537,7 +556,11 @@ def create_subagent_toolset(  # noqa: C901
                 message_history=message_history,
                 on_message_history=save_message_history,
             )
-            return _format_chat_trace_result(result, effective_chat_trace_id)
+            # Don't advertise continuation when the run failed — no message
+            # history was saved, so the chat_trace_id would resume nothing.
+            if handle.status != TaskStatus.FAILED:
+                return _format_chat_trace_result(result, effective_chat_trace_id)
+            return result
         else:
             return await _run_async(
                 agent=agent,
@@ -890,9 +913,11 @@ async def _run_sync(
         if handle is not None:
             handle.result = output
             handle.error = None
-            _capture_result_observability(handle, result)
             handle.status = TaskStatus.COMPLETED
             handle.completed_at = datetime.now()
+            # Telemetry is best-effort and runs after the run is marked complete,
+            # so a capture failure can never flip a successful run to FAILED.
+            _capture_observability_best_effort(handle, result)
         return output
     except Exception as e:
         if handle is not None:
@@ -1013,8 +1038,10 @@ async def _run_async(
             _capture_message_history(result, on_message_history)
             handle.result = _serialize_output(result.output)
             handle.error = None
-            _capture_result_observability(handle, result)
             handle.status = TaskStatus.COMPLETED
+            # Telemetry is best-effort and runs after the run is marked complete,
+            # so a capture failure can never flip a successful run to FAILED.
+            _capture_observability_best_effort(handle, result)
         except asyncio.CancelledError:
             handle.status = TaskStatus.CANCELLED
             handle.error = "Task was cancelled"
@@ -1030,11 +1057,7 @@ async def _run_async(
     # Create the background task
     task_manager.create_task(task_id, run_task(), handle)
 
-    response = (
-        f"Task started in background.\n"
-        f"Task ID: {task_id}\n"
-        f"Subagent: {config['name']}\n"
-    )
+    response = f"Task started in background.\nTask ID: {task_id}\nSubagent: {config['name']}\n"
     if chat_trace_id is not None:
         response += (
             f"Chat Trace ID: {chat_trace_id}\n"

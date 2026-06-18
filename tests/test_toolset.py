@@ -1528,6 +1528,50 @@ class TestAutoModeSelection:
             mock_sync.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_task_sync_failure_omits_chat_trace_hint(self):
+        """A failed sync run must not advertise continuation (no history saved)."""
+        config = SubAgentConfig(
+            name="helper",
+            description="Helps with tasks",
+            instructions="Help with things",
+        )
+
+        def _fail_sync(**kwargs):
+            kwargs["handle"].status = TaskStatus.FAILED
+            return "Error executing task: boom"
+
+        with (
+            patch(
+                "subagents_pydantic_ai.toolset._compile_subagent",
+                return_value=_make_mock_compiled_subagent(config),
+            ),
+            patch(
+                "subagents_pydantic_ai.toolset._run_sync",
+                new_callable=AsyncMock,
+                side_effect=_fail_sync,
+            ),
+        ):
+            toolset = create_subagent_toolset(
+                subagents=[config],
+                include_general_purpose=False,
+            )
+            task_tool = toolset.tools["task"]
+            ctx = MockRunContext(deps=MockDeps())
+            result = await task_tool.function(
+                ctx,
+                "do something",
+                "helper",
+                "sync",
+                TaskPriority.NORMAL,
+                "simple",
+                False,
+                False,
+            )
+
+            assert result == "Error executing task: boom"
+            assert "Chat Trace ID" not in result
+
+    @pytest.mark.asyncio
     async def test_task_auto_mode_complex_uses_async(self):
         """Test auto mode with complex complexity uses async."""
         config = SubAgentConfig(
@@ -3471,6 +3515,7 @@ class TestUsageTracking:
         assert "Result: done" in result
         assert "Usage:" not in result
 
+
 class TestDrainSteeringMessages:
     """Unit tests for `_drain_steering_messages` (parent -> child steering)."""
 
@@ -3613,3 +3658,79 @@ class TestSendMessageToSubagent:
         assert len(msgs) == 1
         assert msgs[0].type == MessageType.TASK_UPDATE
         assert msgs[0].payload == {"message": "narrow the scope"}
+
+
+class TestObservabilityHelpers:
+    """Direct unit tests for the observability helper branches."""
+
+    def test_capture_message_history_skips_result_without_all_messages(self):
+        from subagents_pydantic_ai.toolset import _capture_message_history
+
+        captured: list[Any] = []
+        _capture_message_history(object(), captured.append)
+        assert captured == []
+
+    def test_get_result_traceparent_none_when_absent(self):
+        from subagents_pydantic_ai.toolset import _get_result_traceparent
+
+        assert _get_result_traceparent(object()) is None
+
+    def test_iter_model_responses_includes_result_response(self):
+        from subagents_pydantic_ai.toolset import _iter_model_responses
+
+        sentinel = object()
+
+        class _Result:
+            def all_messages(self) -> list[Any]:
+                return []
+
+            @property
+            def response(self) -> Any:
+                return sentinel
+
+        assert _iter_model_responses(_Result()) == [sentinel]
+
+    def test_capture_observability_sets_trace_and_span_from_traceparent(self):
+        from subagents_pydantic_ai.toolset import _capture_result_observability
+
+        class _Result:
+            usage = None
+            run_id = "r"
+            conversation_id = "c"
+
+            def all_messages_json(self) -> bytes:
+                return b"[]"
+
+            def all_messages(self) -> list[Any]:
+                return []
+
+            def _traceparent(self, required: bool = False) -> str:
+                return "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+        handle = TaskHandle(task_id="t", subagent_name="s", description="d")
+        _capture_result_observability(handle, _Result())
+        assert handle.trace_id == "0af7651916cd43dd8448eb211c80319c"
+        assert handle.span_id == "b7ad6b7169203331"
+
+    def test_capture_observability_ignores_malformed_traceparent(self):
+        from subagents_pydantic_ai.toolset import _capture_result_observability
+
+        class _Result:
+            usage = None
+            run_id = "r"
+            conversation_id = "c"
+
+            def all_messages_json(self) -> bytes:
+                return b"[]"
+
+            def all_messages(self) -> list[Any]:
+                return []
+
+            def _traceparent(self, required: bool = False) -> str:
+                return "00-abc"
+
+        handle = TaskHandle(task_id="t", subagent_name="s", description="d")
+        _capture_result_observability(handle, _Result())
+        assert handle.traceparent == "00-abc"
+        assert handle.trace_id is None
+        assert handle.span_id is None
