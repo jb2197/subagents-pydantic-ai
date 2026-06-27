@@ -1,16 +1,28 @@
-<h1 align="center">Subagents for Pydantic AI</h1>
 <p align="center">
-  <em>Multi-Agent Orchestration for Pydantic AI</em>
+  <img src="assets/social-preview.png" alt="Subagents for Pydantic AI" width="100%">
 </p>
+
+<h1 align="center">Subagents for Pydantic AI</h1>
+
+<p align="center"><em>Declarative multi-agent orchestration — sync, async, or auto.</em></p>
+
 <p align="center">
+  <a href="https://pypi.org/project/subagents-pydantic-ai/"><img src="https://img.shields.io/pypi/v/subagents-pydantic-ai.svg" alt="PyPI version"></a>
+  <a href="https://pepy.tech/projects/subagents-pydantic-ai"><img src="https://static.pepy.tech/badge/subagents-pydantic-ai/month" alt="PyPI Downloads"></a>
+  <a href="https://github.com/vstorm-co/subagents-pydantic-ai/stargazers"><img src="https://img.shields.io/github/stars/vstorm-co/subagents-pydantic-ai?style=flat&logo=github&color=yellow" alt="GitHub Stars"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-blue?logo=python&logoColor=white" alt="Python 3.10+"></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://coveralls.io/github/vstorm-co/subagents-pydantic-ai?branch=main"><img src="https://coveralls.io/repos/github/vstorm-co/subagents-pydantic-ai/badge.svg?branch=main" alt="Coverage Status"></a>
   <a href="https://github.com/vstorm-co/subagents-pydantic-ai/actions/workflows/ci.yml"><img src="https://github.com/vstorm-co/subagents-pydantic-ai/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://coveralls.io/github/vstorm-co/subagents-pydantic-ai?branch=main"><img src="https://img.shields.io/badge/coverage-100%25-brightgreen" alt="Coverage"></a>
-  <a href="https://pypi.org/project/subagents-pydantic-ai/"><img src="https://img.shields.io/pypi/v/subagents-pydantic-ai.svg" alt="PyPI"></a>
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue" alt="Python"></a>
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
+  <a href="https://github.com/pydantic/pydantic-ai"><img src="https://img.shields.io/badge/Powered%20by-Pydantic%20AI-E92063?logo=pydantic&logoColor=white" alt="Pydantic AI"></a>
 </p>
 
 ---
+
+!!! tip "Part of Pydantic Deep Agents"
+    **Subagents for Pydantic AI** is one library in [Pydantic Deep Agents](https://github.com/vstorm-co/pydantic-deepagents) — the open-source
+    Claude Code alternative & Python agent framework. Use it standalone, or get every
+    library wired together in a single `create_deep_agent()` call.
 
 **Subagents for Pydantic AI** adds multi-agent delegation to any [Pydantic AI](https://ai.pydantic.dev/) agent. Spawn specialized subagents that run **synchronously** (blocking), **asynchronously** (background), or let the system **auto-select** the best mode.
 
