@@ -61,6 +61,7 @@ class FakeResult:
 
     @property
     def usage(self) -> Any:
+        # pydantic-ai 2.0: `AgentRunResult.usage` is a property, not a method.
         return self._usage
 
     def all_messages_json(self) -> bytes:
