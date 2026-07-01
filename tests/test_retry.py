@@ -12,6 +12,7 @@ import asyncio
 from typing import Any
 
 import pytest
+from agent_result_fakes import MockResult
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability, ProcessEventStream
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
@@ -45,27 +46,6 @@ from subagents_pydantic_ai.types import (
 )
 
 pytestmark = pytest.mark.asyncio
-
-
-# --------------------------------------------------------------------------- #
-# Fakes
-# --------------------------------------------------------------------------- #
-
-
-class FakeResult:
-    """Stand-in for `AgentRunResult`."""
-
-    def __init__(self, output: str, usage: Any = None) -> None:
-        self.output = output
-        self._usage = usage
-
-    @property
-    def usage(self) -> Any:
-        # pydantic-ai 2.0: `AgentRunResult.usage` is a property, not a method.
-        return self._usage
-
-    def all_messages_json(self) -> bytes:
-        return b"[]"
 
 
 class _ScriptedRun:
@@ -245,7 +225,7 @@ async def test_compute_backoff_delay_with_jitter() -> None:
 
 
 async def test_fast_path_uses_agent_run() -> None:
-    agent = ScriptedAgent([{"result": FakeResult("ok")}])
+    agent = ScriptedAgent([{"result": MockResult("ok")}])
     result = await run_with_retry(
         agent, "go", run_kwargs={"deps": 1}, retry=RetryConfig(max_retries=0)
     )
@@ -265,7 +245,7 @@ async def test_fast_path_propagates_error() -> None:
 
 
 async def test_retry_success_first_try_no_sleep() -> None:
-    agent = ScriptedAgent([{"result": FakeResult("done")}])
+    agent = ScriptedAgent([{"result": MockResult("done")}])
     slept: list[float] = []
 
     async def sleep(d: float) -> None:
@@ -288,7 +268,7 @@ async def test_retry_then_success_resumes_with_history() -> None:
     agent = ScriptedAgent(
         [
             {"iter_raise": ModelHTTPError(503, "m"), "messages": history},
-            {"result": FakeResult("recovered")},
+            {"result": MockResult("recovered")},
         ]
     )
     events: list[tuple[int, str, float]] = []
@@ -354,7 +334,7 @@ async def test_retry_aenter_failure_run_is_none() -> None:
     agent = ScriptedAgent(
         [
             {"aenter_raise": ModelHTTPError(503, "m")},
-            {"result": FakeResult("after-aenter-fail")},
+            {"result": MockResult("after-aenter-fail")},
         ]
     )
     result = await run_with_retry(
@@ -375,7 +355,7 @@ async def test_retry_empty_messages_keeps_prompt() -> None:
     agent = ScriptedAgent(
         [
             {"iter_raise": ModelHTTPError(503, "m"), "messages": []},
-            {"result": FakeResult("ok")},
+            {"result": MockResult("ok")},
         ]
     )
     result = await run_with_retry(
@@ -394,7 +374,7 @@ async def test_retry_on_retry_async_callback_awaited() -> None:
     agent = ScriptedAgent(
         [
             {"iter_raise": ModelHTTPError(503, "m")},
-            {"result": FakeResult("ok")},
+            {"result": MockResult("ok")},
         ]
     )
     awaited: list[int] = []
@@ -418,7 +398,7 @@ async def test_retry_without_on_retry_callback() -> None:
     agent = ScriptedAgent(
         [
             {"iter_raise": ModelHTTPError(503, "m")},
-            {"result": FakeResult("ok")},
+            {"result": MockResult("ok")},
         ]
     )
     result = await run_with_retry(
@@ -434,7 +414,7 @@ async def test_retry_without_on_retry_callback() -> None:
 async def test_retry_pops_caller_message_history() -> None:
     """A caller-supplied message_history seeds the first attempt."""
     seed = [{"role": "user", "content": "seed"}]
-    agent = ScriptedAgent([{"result": FakeResult("ok")}])
+    agent = ScriptedAgent([{"result": MockResult("ok")}])
     await run_with_retry(
         agent,
         "go",
@@ -471,7 +451,7 @@ async def test_cancel_check_stops_run_cooperatively() -> None:
 
 async def test_cancel_check_false_does_not_stop() -> None:
     """A cancel_check that stays False lets the run complete normally."""
-    agent = ScriptedAgent([{"result": FakeResult("done")}])
+    agent = ScriptedAgent([{"result": MockResult("done")}])
 
     result = await run_with_retry(
         agent,
@@ -493,7 +473,7 @@ async def test_run_async_retries_then_completes() -> None:
     agent = ScriptedAgent(
         [
             {"iter_raise": ModelHTTPError(503, "m"), "messages": [{"x": 1}]},
-            {"result": FakeResult("finished", usage=None)},
+            {"result": MockResult("finished", usage=None)},
         ]
     )
     config = SubAgentConfig(
@@ -531,7 +511,18 @@ async def test_run_async_completes_when_observability_attrs_missing() -> None:
     """A result lacking observability attributes (`run_id`/`conversation_id`/
     `all_messages`) must still complete: telemetry capture is best-effort and
     must never flip a successful run to FAILED."""
-    agent = ScriptedAgent([{"result": FakeResult("done", usage=None)}])
+
+    class BareResult:
+        output = "done"
+
+        @property
+        def usage(self) -> None:
+            return None
+
+        def all_messages_json(self) -> bytes:
+            return b"[]"
+
+    agent = ScriptedAgent([{"result": BareResult()}])
     config = SubAgentConfig(name="t", description="d", instructions="i")
     bus = InMemoryMessageBus()
     tm = TaskManager(message_bus=bus)
@@ -706,7 +697,7 @@ async def test_run_kwargs_forwarded_on_every_attempt() -> None:
     agent = ScriptedAgent(
         [
             {"iter_raise": ModelHTTPError(503, "m"), "messages": [{"x": 1}]},
-            {"result": FakeResult("recovered")},
+            {"result": MockResult("recovered")},
         ]
     )
 
