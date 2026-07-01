@@ -142,11 +142,12 @@ def _capture_result_observability(handle: TaskHandle, result: Any) -> None:
     has_cost = False
     tool_call_counts: dict[str, int] = {}
     for response in responses:
-        try:
-            total_cost += response.cost().total_price
-            has_cost = True
-        except (AssertionError, LookupError):
-            pass
+        if response.model_name:
+            try:
+                total_cost += response.cost().total_price
+                has_cost = True
+            except (AssertionError, LookupError):
+                pass
 
         for tool_call in response.tool_calls:
             tool_call_counts[tool_call.tool_name] = tool_call_counts.get(tool_call.tool_name, 0) + 1

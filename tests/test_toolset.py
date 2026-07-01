@@ -119,6 +119,7 @@ class MockModelResponse:
     """Minimal pydantic-ai ModelResponse stand-in for observability tests."""
 
     kind = "response"
+    cost_called = False
 
     def __init__(
         self,
@@ -136,8 +137,10 @@ class MockModelResponse:
         self.finish_reason = "stop"
         self.tool_calls = [SimpleNamespace(tool_name=name) for name in tool_names or []]
         self._total_price = total_price
+        self.cost_called = False
 
     def cost(self) -> Any:
+        self.cost_called = True
         return SimpleNamespace(total_price=self._total_price)
 
 
@@ -1055,6 +1058,36 @@ class TestResultObservability:
         assert handle.finish_reason == "stop"
         assert handle.cost == Decimal("0.03")
         assert handle.tool_call_counts == {"search": 2, "task": 1}
+
+    def test_capture_result_observability_skips_cost_without_model_name(self):
+        response_without_model_name = MockModelResponse(
+            model_name="",
+            provider_name="openai",
+            total_price=Decimal("0.01"),
+            tool_names=["search"],
+        )
+        priced_response = MockModelResponse(
+            model_name="gpt-priced",
+            provider_name="openai",
+            total_price=Decimal("0.02"),
+            tool_names=["task"],
+        )
+        result = MockResult(
+            "done",
+            messages=[response_without_model_name, priced_response],
+        )
+        handle = TaskHandle(
+            task_id="task-123",
+            subagent_name="test",
+            description="do the thing",
+        )
+
+        _capture_result_observability(handle, result)
+
+        assert not response_without_model_name.cost_called
+        assert priced_response.cost_called
+        assert handle.cost == Decimal("0.02")
+        assert handle.tool_call_counts == {"search": 1, "task": 1}
 
 
 class TestRunAsync:
