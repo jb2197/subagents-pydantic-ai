@@ -128,8 +128,11 @@ def _capture_result_observability(handle: TaskHandle, result: Any) -> None:
 
     responses = _iter_model_responses(result)
     if responses:
-        # Model/provider metadata reflects the last response (the model that
-        # produced the final output); `cost`/`tool_call_counts` below sum across all.
+        # Final response wins for per-run model/provider metadata: it is the
+        # model response that produced the returned output. In a multi-model
+        # run, earlier responses' model/provider metadata is not captured on
+        # the handle; aggregate fields such as `cost` and `tool_call_counts`
+        # are summed across all responses.
         response = responses[-1]
         handle.model_name = response.model_name
         handle.provider_name = response.provider_name
