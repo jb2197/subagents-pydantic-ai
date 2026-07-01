@@ -174,13 +174,8 @@ def _capture_observability_best_effort(handle: TaskHandle, result: Any) -> None:
 
 
 def _format_chat_trace_result(output: str, chat_trace_id: str) -> str:
-    """Append chat trace continuation instructions to a subagent result."""
-    return (
-        f"{output}\n\n"
-        f"Chat Trace ID: {chat_trace_id}\n"
-        "To continue this subagent conversation, pass this chat_trace_id to task(). "
-        "Omit chat_trace_id to start a new conversation."
-    )
+    """Append a compact chat trace identifier to a subagent result."""
+    return f"{output}\n\nChat Trace ID: {chat_trace_id}"
 
 
 async def _drain_steering_messages(message_bus: InMemoryMessageBus, agent_id: str) -> list[str]:
@@ -517,7 +512,7 @@ def create_subagent_toolset(  # noqa: C901
         # Generate task ID
         task_id = str(uuid.uuid4())[:8]
 
-        effective_chat_trace_id = chat_trace_id or str(uuid.uuid4())[:8]
+        effective_chat_trace_id = chat_trace_id or uuid.uuid4().hex
         chat_trace_key = (config["name"], effective_chat_trace_id)
         message_history = message_history_store.get(chat_trace_key)
 
@@ -1063,11 +1058,7 @@ async def _run_async(
 
     response = f"Task started in background.\nTask ID: {task_id}\nSubagent: {config['name']}\n"
     if chat_trace_id is not None:
-        response += (
-            f"Chat Trace ID: {chat_trace_id}\n"
-            "To continue this subagent conversation, pass this chat_trace_id to task(). "
-            "Omit chat_trace_id to start a new conversation.\n"
-        )
+        response += f"Chat Trace ID: {chat_trace_id}\n"
     response += f"Use check_task('{task_id}') to check status."
     return response
 

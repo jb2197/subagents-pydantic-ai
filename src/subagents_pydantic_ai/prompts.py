@@ -78,9 +78,9 @@ constraints. The more specific, the better the result.
 results before presenting to the user. Don't just relay raw output.
 - **Choose the right subagent**: Match the subagent_type to the task. \
 Use "general-purpose" when no specialized subagent fits.
-- **Continue intentionally**: Every task returns a `chat_trace_id`. Pass it back \
-only when you want the same subagent to resume that conversation. Omit \
-`chat_trace_id` to start a new conversation.
+- **Continue intentionally**: When a result includes `Chat Trace ID: <id>`, pass \
+that value as `chat_trace_id` only when you want the same subagent to resume \
+that conversation. Omit `chat_trace_id` to start a new conversation.
 
 ## Execution modes
 - **"sync"** (default): Blocks until the subagent completes. Use for quick \

@@ -1345,7 +1345,9 @@ class TestToolsetIntegration:
             handle = mock_run_sync.call_args.kwargs["handle"]
             assert handle.task_id in toolset.task_manager.handles  # type: ignore[attr-defined]
             assert handle.chat_trace_id in result
-            assert "pass this chat_trace_id to task()" in result
+            assert len(handle.chat_trace_id) == 32
+            int(handle.chat_trace_id, 16)
+            assert "pass this chat_trace_id to task()" not in result
 
     @pytest.mark.asyncio
     async def test_task_sync_forwards_ask_user(self):
@@ -1507,6 +1509,10 @@ class TestToolsetIntegration:
 
             assert first_chat_trace_id
             assert second_chat_trace_id
+            assert len(first_chat_trace_id) == 32
+            assert len(second_chat_trace_id) == 32
+            int(first_chat_trace_id, 16)
+            int(second_chat_trace_id, 16)
             assert second_chat_trace_id != first_chat_trace_id
             assert continued.startswith(f"done\n\nChat Trace ID: {first_chat_trace_id}")
             assert mock_agent.iter_calls[0]["message_history"] is None
