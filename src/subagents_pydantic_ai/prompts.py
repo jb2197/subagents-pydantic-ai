@@ -80,7 +80,9 @@ results before presenting to the user. Don't just relay raw output.
 Use "general-purpose" when no specialized subagent fits.
 - **Continue intentionally**: When a result includes `Chat Trace ID: <id>`, pass \
 that value as `chat_trace_id` only when you want the same subagent to resume \
-that conversation. Omit `chat_trace_id` to start a new conversation.
+that conversation. Omit `chat_trace_id` to start a new conversation. A trace \
+can only be continued after its current task finishes, and only with the same \
+subagent; continuing a busy or unknown trace returns an error.
 
 ## Execution modes
 - **"sync"** (default): Blocks until the subagent completes. Use for quick \

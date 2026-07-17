@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Stateful subagent conversations via `chat_trace_id`** ([#44](https://github.com/vstorm-co/subagents-pydantic-ai/pull/44)). Every successful `task()` result now ends with a `Chat Trace ID: <id>` line; passing that ID back to `task()` resumes the same subagent conversation with its full message history (stored per `(subagent_name, chat_trace_id)`). Guard rails: a trace can only be continued once its current task has finished (continuing a busy trace returns an error instead of racing and losing one branch of history), continuing an unknown/evicted trace returns an error instead of silently starting a fresh conversation, and a failed first run does not advertise a trace ID. The store is LRU-bounded by the new `max_chat_traces` parameter on `create_subagent_toolset` (default 100) so long-lived sessions don't grow memory without bound.
+- **Rich per-task observability on `TaskHandle`** ([#44](https://github.com/vstorm-co/subagents-pydantic-ai/pull/44)). Both sync and async runs now populate the handle with `usage` (including provider detail counters), `message_history` (JSON), `run_id`, `conversation_id`, `traceparent`/`trace_id`/`span_id`, final-response `model_name`/`provider_name`/`provider_url`/`provider_response_id`/`provider_details`/`finish_reason`, summed `cost` (via genai-prices), and `tool_call_counts`. Capture is best-effort by design: the run is marked `COMPLETED` before telemetry is collected, and any capture failure (including message-history capture) logs a warning instead of flipping a successful run to `FAILED`. Sync tasks now register handles too, so `get_total_usage()` finally includes sync runs. Retained finished handles are bounded by the new `max_task_handles` parameter (default 500); evicted handles fold their token usage into `get_total_usage()` totals so aggregates stay correct.
+
+### Changed
+
+- **`check_task()` and `wait_tasks()` no longer embed usage details in tool-return text.** Observability data lives on the `TaskHandle` (inspect `toolset.task_manager`) instead of being fed back into the parent's context. `check_task` shows the `Chat Trace ID` only for completed tasks, matching `wait_tasks`, so continuation is never advertised for a run whose history was not saved.
+
 ## [0.2.8] - 2026-06-26
 
 ### Fixed
