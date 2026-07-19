@@ -28,6 +28,8 @@ toolset = create_subagent_toolset(subagents=subagents)
 | `max_nesting_depth` | `int` | `2` | Maximum subagent nesting depth |
 | `general_purpose_config` | `SubAgentConfig \| None` | Auto | Config for the "general" subagent |
 | `descriptions` | `dict[str, str] \| None` | `None` | Override default tool descriptions by tool name |
+| `max_chat_traces` | `int` | `100` | Max subagent conversations kept for `chat_trace_id` continuation (LRU-evicted) |
+| `max_task_handles` | `int` | `500` | Max finished task handles retained for status/observability (oldest evicted; usage totals preserved) |
 
 ## Adding to an Agent
 
@@ -108,6 +110,42 @@ task(
 | `description` | `str` | What the subagent should do |
 | `subagent_type` | `str` | Name of the subagent to use |
 | `mode` | `str` | `"sync"`, `"async"`, or `"auto"` |
+| `chat_trace_id` | `str \| None` | Continue a previous subagent conversation (see below) |
+
+#### Stateful conversations (`chat_trace_id`)
+
+Every successful task result ends with a `Chat Trace ID: <id>` line. Passing
+that ID back to `task()` resumes the same subagent conversation: the subagent
+sees the full message history of its previous run and continues from there.
+Omit `chat_trace_id` to start a fresh conversation.
+
+```python
+# First task — a new conversation is created automatically:
+task(description="Read the auth module and summarize it", subagent_type="researcher")
+# -> "...summary...\n\nChat Trace ID: 3f2a..."
+
+# Follow-up in the same conversation — the subagent remembers the module:
+task(
+    description="Now list the security issues you noticed",
+    subagent_type="researcher",
+    chat_trace_id="3f2a...",
+)
+```
+
+Rules and limits:
+
+- A trace belongs to one subagent: the history is stored per
+  `(subagent_name, chat_trace_id)`.
+- A trace can only be continued after its current task finishes. Continuing a
+  trace that still has a running task returns an error — wait via
+  `check_task`/`wait_tasks` first.
+- Passing an unknown `chat_trace_id` (typo, evicted trace, or a trace whose
+  first run failed) returns an error instead of silently starting over.
+- Only the `max_chat_traces` most recently used conversations are kept
+  (default 100, configurable on `create_subagent_toolset`); older ones are
+  evicted to bound memory in long-lived sessions.
+- History grows with every continuation — the full prior conversation is
+  replayed on each resumed run, so long traces cost more tokens per call.
 
 ### check_task
 
