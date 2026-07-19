@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-07-19
 
 ### Added
 
@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **`check_task()` and `wait_tasks()` no longer embed usage details in tool-return text.** Observability data lives on the `TaskHandle` (inspect `toolset.task_manager`) instead of being fed back into the parent's context. `check_task` shows the `Chat Trace ID` only for completed tasks, matching `wait_tasks`, so continuation is never advertised for a run whose history was not saved.
+
+### Documentation
+
+- **Brand refresh** ([#48](https://github.com/vstorm-co/subagents-pydantic-ai/pull/48)): new social preview card, Pydantic favicon/logo in mkdocs, unified README header with the "Part of Pydantic Deep Agents" callout and Vstorm OSS ecosystem section.
+- New "Stateful conversations (`chat_trace_id`)" section in `docs/concepts/toolset.md`, plus the `max_chat_traces` / `max_task_handles` factory parameters.
 
 ## [0.2.8] - 2026-06-26
 
