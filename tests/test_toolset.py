@@ -1559,12 +1559,24 @@ class TestChatTraceLifecycle:
         task_tool = toolset.tools["task"]
         ctx = MockRunContext(deps=MockDeps())
 
+        # A stale finished handle without usage (e.g. a cancelled task) is
+        # evicted first and must not contribute to the totals.
+        stale = TaskHandle(
+            task_id="stale-no-usage",
+            subagent_name="worker",
+            description="old cancelled task",
+            status=TaskStatus.CANCELLED,
+            completed_at=datetime(2020, 1, 1),
+        )
+        toolset.task_manager.handles["stale-no-usage"] = stale
+
         for i in range(4):
             await task_tool.function(ctx, f"job {i}", "worker", "sync")
 
         # Eviction runs before each new task registers its handle: before the
         # 4th task there were 3 finished handles, so the oldest was dropped.
         assert len(toolset.task_manager.handles) == 3
+        assert "stale-no-usage" not in toolset.task_manager.handles
         # All 4 runs still counted (MockUsage: 100 in / 50 out / 1 request).
         totals = toolset.get_total_usage()
         assert totals == {
@@ -1573,6 +1585,35 @@ class TestChatTraceLifecycle:
             "total_tokens": 600,
             "requests": 4,
         }
+
+    @pytest.mark.asyncio
+    async def test_async_dispatch_failure_releases_chat_trace(self):
+        """If _run_async raises before the background task takes ownership,
+        the trace guard is released so the conversation stays continuable."""
+        saved_history = [{"role": "assistant", "content": "remembered"}]
+        mock_agent = FakeAgent(result=MockResultWithMessages("done", messages=saved_history))
+        toolset = self._make_toolset(mock_agent)
+        task_tool = toolset.tools["task"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        trace_id = self._trace_id(await task_tool.function(ctx, "seed", "worker", "sync"))
+
+        with (
+            patch(
+                "subagents_pydantic_ai.toolset._run_async",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("dispatch failed"),
+            ),
+            pytest.raises(RuntimeError, match="dispatch failed"),
+        ):
+            await task_tool.function(ctx, "continue", "worker", "async", chat_trace_id=trace_id)
+
+        # The guard was released, so continuing the trace works instead of
+        # returning a "already has a running task" error.
+        continued = await task_tool.function(
+            ctx, "continue", "worker", "sync", chat_trace_id=trace_id
+        )
+        assert continued.startswith(f"done\n\nChat Trace ID: {trace_id}")
 
     @pytest.mark.asyncio
     async def test_run_sync_completes_when_history_capture_raises(self):
