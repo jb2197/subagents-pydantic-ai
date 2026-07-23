@@ -836,13 +836,13 @@ def create_subagent_toolset(  # noqa: C901
             status = handle.status
             if status == "completed":
                 finished_count += 1
-                result_preview = (handle.result or "")[:2000]
+                result = handle.result or ""
                 chat_trace_line = ""
                 if handle.chat_trace_id is not None:
                     chat_trace_line = f"Chat Trace ID: {handle.chat_trace_id}\n"
                 lines.append(
                     f"- {tid} ({handle.subagent_name}): COMPLETED\n"
-                    f"{chat_trace_line}{result_preview}"
+                    f"{chat_trace_line}{result}"
                 )
             elif status == "failed":
                 finished_count += 1

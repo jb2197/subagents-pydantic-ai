@@ -2522,6 +2522,26 @@ class TestToolsetFunctionsCoverage:
             assert "Research findings here" in result
 
     @pytest.mark.asyncio
+    async def test_wait_tasks_returns_complete_long_result(self):
+        """Test wait_tasks does not truncate completed task results."""
+        long_result = "x" * 2000 + "complete tail"
+        toolset = create_subagent_toolset(default_model="test")
+        handle = TaskHandle(
+            task_id="long-result",
+            subagent_name="worker",
+            description="return a long result",
+            status=TaskStatus.COMPLETED,
+            result=long_result,
+        )
+        toolset.task_manager.handles[handle.task_id] = handle  # type: ignore[attr-defined]
+
+        wait_tool = toolset.tools["wait_tasks"]
+        ctx = MockRunContext(deps=MockDeps())
+        result = await wait_tool.function(ctx, [handle.task_id])
+
+        assert long_result in result
+
+    @pytest.mark.asyncio
     async def test_wait_tasks_with_failure(self):
         """Test wait_tasks handles failed tasks."""
         config = SubAgentConfig(
